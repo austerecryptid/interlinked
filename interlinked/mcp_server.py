@@ -25,8 +25,11 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any
+
+import httpx
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -63,12 +66,29 @@ def create_mcp_server(project_path: str) -> Server:
     handshake responds immediately (large projects can take 10+ seconds
     to parse, which exceeds Windsurf's startup timeout).
     """
-    # Lazy state — built on first tool call
-    _state: dict[str, Any] = {"graph": None, "engine": None, "ready": False}
+    # Lazy state — built on first tool call (only if no web server is running)
+    _state: dict[str, Any] = {
+        "graph": None, "engine": None, "ready": False,
+        "server_url": None, "server_checked": False,
+    }
+
+    def _check_server(port: int = 8420) -> str | None:
+        """Check if the web visualizer is running. Returns base URL or None."""
+        if _state["server_checked"]:
+            return _state["server_url"]
+        url = f"http://127.0.0.1:{port}"
+        try:
+            r = httpx.get(f"{url}/api/stats", timeout=1.0)
+            if r.status_code == 200:
+                _state["server_url"] = url
+                print(f"Connected to visualizer at {url}", file=sys.stderr)
+        except Exception:
+            pass
+        _state["server_checked"] = True
+        return _state["server_url"]
 
     def _ensure_ready() -> tuple[CodeGraph, QueryEngine]:
         if not _state["ready"]:
-            import sys
             print(f"Analyzing {project_path} ...", file=sys.stderr)
             graph, engine = build_graph(project_path)
             _state["graph"] = graph
@@ -243,8 +263,15 @@ def create_mcp_server(project_path: str) -> Server:
         nonlocal api_key
 
         try:
-            graph, engine = _ensure_ready()
+            # Try proxying through the running web server first
+            server_url = _check_server()
+            if server_url:
+                result = _dispatch_via_server(name, arguments, server_url)
+                if result is not None:
+                    return [TextContent(type="text", text=str(result))]
 
+            # Fall back to direct graph mode
+            graph, engine = _ensure_ready()
             result = _dispatch_tool(name, arguments, engine, graph, api_key)
             if name == "interlinked_set_api_key":
                 api_key = arguments.get("api_key", "")
@@ -255,6 +282,84 @@ def create_mcp_server(project_path: str) -> Server:
             return [TextContent(type="text", text=f"Error: {e}")]
 
     return server
+
+
+def _dispatch_via_server(name: str, args: dict[str, Any], server_url: str) -> str | None:
+    """Proxy an MCP tool call through the running web server's REST API.
+
+    Returns the result string, or None if the tool can't be proxied
+    (falls back to direct mode).
+    """
+    # Map MCP tool names to REST endpoints and request bodies
+    _TOOL_TO_ENDPOINT: dict[str, tuple[str, str, dict]] = {
+        # (method, path, body)
+        "interlinked_stats":       ("GET",  "/api/stats", {}),
+        "interlinked_isolate":     ("POST", "/api/isolate", {
+            "target": args.get("target", ""),
+            "level": args.get("level", "function"),
+            "depth": args.get("depth", 3),
+            "edge_types": args.get("edge_types"),
+        }),
+        "interlinked_zoom":        ("POST", "/api/zoom", {"level": args.get("level", "module")}),
+        "interlinked_focus":       ("POST", "/api/focus", {
+            "node_id": args.get("node_id", ""),
+            "depth": args.get("depth", 2),
+        }),
+        "interlinked_query":       ("POST", "/api/query", {"expression": args.get("expression", "")}),
+        "interlinked_trace_variable": ("POST", "/api/trace_variable", {
+            "variable": args.get("variable", ""),
+            "origin": args.get("origin"),
+        }),
+        "interlinked_propose_function": ("POST", "/api/propose", {
+            "name": args.get("name", ""),
+            "module": args.get("module", ""),
+            "calls": args.get("calls"),
+            "called_by": args.get("called_by"),
+        }),
+        "interlinked_find_duplicates": ("POST", "/api/find_duplicates", {
+            "threshold": args.get("threshold", 0.6),
+            "scope": args.get("scope"),
+        }),
+        "interlinked_similar_to":  ("POST", "/api/similar_to", {
+            "target": args.get("target", ""),
+            "threshold": args.get("threshold", 0.5),
+        }),
+        "interlinked_get_context": ("POST", "/api/get_context", {"target": args.get("target", "")}),
+        "interlinked_command":     ("POST", "/api/command", {"command": args.get("command", "")}),
+        "interlinked_switch_project": ("POST", "/api/switch_project", {"path": args.get("path", "")}),
+        "interlinked_reset":       ("POST", "/api/reset", {}),
+    }
+
+    if name not in _TOOL_TO_ENDPOINT:
+        return None
+
+    method, path, body = _TOOL_TO_ENDPOINT[name]
+    url = f"{server_url}{path}"
+
+    try:
+        if method == "GET":
+            r = httpx.get(url, timeout=30.0)
+        else:
+            r = httpx.post(url, json=body, timeout=30.0)
+        data = r.json()
+
+        # Extract the most useful part of the response for the LLM
+        if "result" in data:
+            result = data["result"]
+            if isinstance(result, (dict, list)):
+                return json.dumps(result, indent=2)
+            return str(result)
+        if "results" in data:
+            results = data["results"]
+            if len(results) > 20:
+                return f"Found {len(results)} results. Showing first 20:\n" + json.dumps(results[:20], indent=2)
+            return json.dumps(results, indent=2)
+        if "error" in data:
+            return f"Error: {data['error']}"
+        return json.dumps(data, indent=2)
+    except Exception as e:
+        print(f"Server proxy failed for {name}: {e}", file=sys.stderr)
+        return None
 
 
 def _dispatch_tool(
