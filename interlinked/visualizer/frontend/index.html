@@ -1185,6 +1185,7 @@ function App() {
   const activeEdgeTypes = snapshot?.view?.visible_edge_types || ['calls','imports','inherits','reads','writes','contains','returns'];
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [rightPanelOpen, setRightPanelOpen] = useState(true);
+  const [glowEnabled, setGlowEnabled] = useState(true);
 
   const handleEdgeToggle = useCallback((edgeType) => {
     const current = new Set(activeEdgeTypes);
@@ -1206,7 +1207,8 @@ function App() {
   return (
     <div className="app-container" style={{ gridTemplateColumns: gridCols }}>
       <Header stats={stats} currentZoom={currentZoom} onZoom={handleZoom}
-        activeEdgeTypes={activeEdgeTypes} onEdgeToggle={handleEdgeToggle} />
+        activeEdgeTypes={activeEdgeTypes} onEdgeToggle={handleEdgeToggle}
+        glowEnabled={glowEnabled} onGlowToggle={() => setGlowEnabled(g => !g)} />
 
       {/* Sidebar collapse toggle */}
       {!sidebarOpen && (
@@ -1219,7 +1221,7 @@ function App() {
       )}
 
       {sidebarOpen && <Sidebar nodes={snapshot?.nodes || []} selectedNode={selectedNode} onNodeClick={handleNodeClick} />}
-      <GraphCanvas snapshot={snapshot} selectedNode={selectedNode} onNodeClick={handleNodeClick} onNodeDoubleClick={handleNodeDoubleClick} />
+      <GraphCanvas snapshot={snapshot} selectedNode={selectedNode} onNodeClick={handleNodeClick} onNodeDoubleClick={handleNodeDoubleClick} glowEnabled={glowEnabled} />
 
       {/* Right panel collapse toggle */}
       {!rightPanelOpen && (
@@ -1245,7 +1247,7 @@ function App() {
   );
 }
 
-function Header({ stats, currentZoom, onZoom, activeEdgeTypes, onEdgeToggle }) {
+function Header({ stats, currentZoom, onZoom, activeEdgeTypes, onEdgeToggle, glowEnabled, onGlowToggle }) {
   const edgeSet = new Set(activeEdgeTypes || []);
   const EDGE_CHIPS = [
     { type: 'calls',    color: '#88bbdd' },
@@ -1282,13 +1284,17 @@ function Header({ stats, currentZoom, onZoom, activeEdgeTypes, onEdgeToggle }) {
               onClick={() => onZoom(level)}>{level}</button>
           ))}
         </div>
-        <div style={{ display: 'flex', gap: 3, justifyContent: 'flex-end' }}>
+        <div style={{ display: 'flex', gap: 3, justifyContent: 'flex-end', alignItems: 'center' }}>
           {EDGE_CHIPS.map(({ type, color }) => (
             <button key={type}
               className={`edge-chip ${edgeSet.has(type) ? 'active' : ''}`}
               style={edgeSet.has(type) ? { borderColor: color + '88', color: color } : {}}
               onClick={() => onEdgeToggle(type)}>{type}</button>
           ))}
+          <span style={{ width: 1, height: 16, background: '#ffffff15', margin: '0 4px' }} />
+          <button className={`edge-chip ${glowEnabled ? 'active' : ''}`}
+            style={glowEnabled ? { borderColor: '#00d4ff55', color: '#00d4ff' } : {}}
+            onClick={onGlowToggle}>✨ glow</button>
         </div>
       </div>
     </div>
@@ -1322,7 +1328,7 @@ function Sidebar({ nodes, selectedNode, onNodeClick }) {
   );
 }
 
-function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick }) {
+function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick, glowEnabled = true }) {
   const svgRef = useRef(null);
   const containerRef = useRef(null);
 
@@ -1373,8 +1379,9 @@ function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick })
         .attr('fill', color).attr('opacity', 1);
     });
 
-    // Glow filters — skip for huge graphs (major perf drain)
-    if (!isHuge) {
+    // Glow filters — user-toggled (off saves major perf on huge graphs)
+    const showGlow = glowEnabled;
+    if (showGlow) {
       const glow = defs.append('filter').attr('id', 'glow');
       glow.append('feGaussianBlur').attr('stdDeviation', '3').attr('result', 'coloredBlur');
       const merge = glow.append('feMerge');
@@ -1461,13 +1468,13 @@ function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick })
     const edgeGlowG = g.append('g').attr('class', 'edge-glow-layer');
     const edgeMainG = g.append('g').attr('class', 'edge-main-layer');
 
-    // Glow layer (skip entirely for huge graphs)
-    const edgeGlow = isHuge ? edgeGlowG.selectAll('line') :
+    // Glow layer (skip when glow disabled)
+    const edgeGlow = !showGlow ? edgeGlowG.selectAll('line') :
       edgeGlowG.selectAll('line').data(edges).join('line')
         .attr('stroke', d => edgeColor(d))
         .attr('stroke-width', d => hasHighlights && edgeShouldGlow(d) ? 8 : 4)
         .attr('opacity', d => hasHighlights ? (edgeShouldGlow(d) ? 0.35 : 0) : 0.06)
-        .attr('filter', d => hasHighlights && edgeShouldGlow(d) ? 'url(#glow)' : null);
+        .attr('filter', d => (showGlow && hasHighlights && edgeShouldGlow(d)) ? 'url(#glow)' : null);
 
     const edgeSelection = edgeMainG.selectAll('line').data(edges).join('line')
       .attr('stroke', d => {
@@ -1511,8 +1518,8 @@ function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick })
       .on('click', (event, d) => onNodeClick(d))
       .on('dblclick', (event, d) => { event.stopPropagation(); onNodeDoubleClick(d); });
 
-    // Outer glow halo — skip for huge graphs
-    if (!isHuge) {
+    // Outer glow halo — skip when glow disabled
+    if (showGlow) {
       nodeGroup.filter(d => highlightedSet.has(d.id)).append('path')
         .attr('class', 'node-halo')
         .attr('d', d => {
@@ -1546,7 +1553,7 @@ function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick })
       })
       .attr('stroke-width', d => isDimmed(d.id) ? 0.5 : (highlightedSet.has(d.id) ? 1.5 : 1))
       .attr('filter', d => {
-        if (isHuge) return null;
+        if (!showGlow) return null;
         return highlightedSet.has(d.id) ? 'url(#glow-strong)' : isDimmed(d.id) ? null : 'url(#glow)';
       });
 
@@ -1556,7 +1563,7 @@ function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick })
       .attr('dy', d => (NODE_SIZES[d.symbol_type] || 10) + 15)
       .attr('opacity', d => isDimmed(d.id) ? 0.06 : 1)
       .attr('fill', d => highlightedSet.has(d.id) ? (hasTraceRoles ? nodeColor(d) : '#ffffff') : null)
-      .attr('filter', d => (!isHuge && highlightedSet.has(d.id)) ? 'url(#glow)' : null)
+      .attr('filter', d => (showGlow && highlightedSet.has(d.id)) ? 'url(#glow)' : null)
       .text(d => d.name);
 
     // ── LOD: viewport culling + detail levels on zoom ─────────────
@@ -1565,7 +1572,7 @@ function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick })
       // LOD thresholds
       const showLabels = k > 0.4;
       const showDimmedEdges = k > 0.25 || !hasHighlights;
-      const showEdgeGlow = k > 0.3 && !isHuge;
+      const showEdgeGlow = k > 0.3 && showGlow;
 
       // Viewport bounds in graph coordinates (with padding)
       const pad = 200 / k;
@@ -1592,7 +1599,7 @@ function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick })
         return (inView(sx, sy) || inView(tx, ty)) ? null : 'none';
       });
 
-      if (!isHuge) {
+      if (showGlow) {
         edgeGlow.attr('display', d => {
           if (!showEdgeGlow) return 'none';
           const sx = d.source.x, sy = d.source.y, tx = d.target.x, ty = d.target.y;
@@ -1607,7 +1614,7 @@ function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick })
 
     sim.on('tick', () => {
       tickCount++;
-      if (!isHuge) {
+      if (showGlow) {
         edgeGlow.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
           .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
       }
@@ -1623,7 +1630,7 @@ function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick })
     sim.on('end', () => { if (isLarge) applyLOD(); });
 
     return () => sim.stop();
-  }, [snapshot, onNodeClick, onNodeDoubleClick]);
+  }, [snapshot, onNodeClick, onNodeDoubleClick, glowEnabled]);
 
   const ctx = snapshot?.view?.context;
   const hasContext = ctx && (ctx.what || ctx.why || ctx.where);
