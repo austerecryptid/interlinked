@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +65,7 @@ def create_mcp_server(project_path: str) -> Server:
     to parse, which exceeds Windsurf's startup timeout).
     """
     # Lazy state — built on first tool call
-    _state: dict[str, Any] = {"graph": None, "engine": None, "ready": False}
+    _state: dict[str, Any] = {"graph": None, "engine": None, "ready": False, "visualizer_url": None}
 
     def _ensure_ready() -> tuple[CodeGraph, QueryEngine]:
         if not _state["ready"]:
@@ -236,6 +237,18 @@ def create_mcp_server(project_path: str) -> Server:
                     "required": ["api_key"],
                 },
             ),
+            Tool(
+                name="interlinked_visualizer",
+                description="Start the interactive web visualizer for the analyzed project. Opens a browser UI showing the codebase graph with live updates as you use other interlinked tools. Returns the URL. Calling again returns the existing URL if already running.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "port": {"type": "integer", "description": "Port to run on (default 8420)", "default": 8420},
+                        "host": {"type": "string", "description": "Host to bind to (default 127.0.0.1)", "default": "127.0.0.1"},
+                    },
+                    "required": [],
+                },
+            ),
         ]
 
     @server.call_tool()
@@ -244,6 +257,15 @@ def create_mcp_server(project_path: str) -> Server:
 
         try:
             graph, engine = _ensure_ready()
+
+            if name == "interlinked_visualizer":
+                if _state["visualizer_url"]:
+                    return [TextContent(type="text", text=f"Visualizer already running at {_state['visualizer_url']}")]
+                host = arguments.get("host", "127.0.0.1")
+                port = arguments.get("port", 8420)
+                result = _start_visualizer(graph, engine, host, port, project_path, _state)
+                return [TextContent(type="text", text=result)]
+
             result = _dispatch_tool(name, arguments, engine, graph, api_key)
             if name == "interlinked_set_api_key":
                 api_key = arguments.get("api_key", "")
@@ -254,6 +276,26 @@ def create_mcp_server(project_path: str) -> Server:
             return [TextContent(type="text", text=f"Error: {e}")]
 
     return server
+
+
+def _start_visualizer(
+    graph: CodeGraph, engine: QueryEngine,
+    host: str, port: int, project_path: str, _state: dict[str, Any],
+) -> str:
+    """Start the web visualizer in a background thread, sharing the MCP graph/engine."""
+    import uvicorn
+    from interlinked.visualizer.server import create_app
+
+    app = create_app(graph, initial_path=project_path, engine=engine)
+    url = f"http://{host}:{port}"
+
+    def _run():
+        uvicorn.run(app, host=host, port=port, log_level="warning")
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    _state["visualizer_url"] = url
+    return f"Visualizer started at {url} — open in your browser. MCP tool calls will update the graph in real time."
 
 
 def _dispatch_tool(
