@@ -57,8 +57,24 @@ def build_graph(project_path: str) -> tuple[CodeGraph, QueryEngine]:
 
 
 def create_mcp_server(project_path: str) -> Server:
-    """Create an MCP server with all Interlinked tools."""
-    graph, engine = build_graph(project_path)
+    """Create an MCP server with all Interlinked tools.
+
+    Graph building is deferred until the first tool call so the MCP
+    handshake responds immediately (large projects can take 10+ seconds
+    to parse, which exceeds Windsurf's startup timeout).
+    """
+    # Lazy state — built on first tool call
+    _state: dict[str, Any] = {"graph": None, "engine": None, "ready": False}
+
+    def _ensure_ready() -> tuple[CodeGraph, QueryEngine]:
+        if not _state["ready"]:
+            import sys
+            print(f"Analyzing {project_path} ...", file=sys.stderr)
+            graph, engine = build_graph(project_path)
+            _state["graph"] = graph
+            _state["engine"] = engine
+            _state["ready"] = True
+        return _state["graph"], _state["engine"]
 
     # Pick up API key from env if available
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -227,6 +243,7 @@ def create_mcp_server(project_path: str) -> Server:
         nonlocal api_key
 
         try:
+            graph, engine = _ensure_ready()
             result = _dispatch_tool(name, arguments, engine, graph, api_key)
             if name == "interlinked_set_api_key":
                 api_key = arguments.get("api_key", "")
