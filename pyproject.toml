@@ -32,8 +32,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/interlinked-dev/interlinked"
-Repository = "https://github.com/interlinked-dev/interlinked"
+Homepage = "https://github.com/austerecryptid/interlinked"
+Repository = "https://github.com/austerecryptid/interlinked"
 
 [project.scripts]
 interlinked = "interlinked.cli:main"
