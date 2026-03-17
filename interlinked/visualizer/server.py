@@ -16,7 +16,7 @@ from interlinked.analyzer.graph import CodeGraph
 from interlinked.commander.query import QueryEngine
 from interlinked.commander.llm import LLMAdapter, get_system_prompt
 from interlinked.visualizer.layouts import compute_layout
-from interlinked.models import ViewState
+from interlinked.models import ViewState, NodeData, EdgeData
 
 FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"
 
@@ -59,19 +59,19 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
 
     # ── Broadcast view changes to all SSE clients ────────────────
 
+    def _layout_from_snap(snap: dict) -> dict:
+        """Compute layout from the snapshot's visible nodes/edges only."""
+        snap_nodes = [NodeData(**n) for n in snap.get("nodes", [])]
+        snap_edges = [EdgeData(**e) for e in snap.get("edges", [])]
+        return compute_layout(snap_nodes, snap_edges)
+
     def _snapshot_with_layout() -> dict:
         snap = engine.snapshot()
-        snap["layout"] = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
+        snap["layout"] = _layout_from_snap(snap)
         return snap
 
     def on_view_change(snapshot: dict) -> None:
-        snapshot["layout"] = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
+        snapshot["layout"] = _layout_from_snap(snapshot)
         msg = json.dumps({"type": "snapshot", "data": snapshot})
         dead: list[asyncio.Queue] = []
         for q in sse_queues:
@@ -115,11 +115,7 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
     @app.get("/api/snapshot")
     async def get_snapshot() -> JSONResponse:
         snap = engine.snapshot()
-        layout = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
-        snap["layout"] = layout
+        snap["layout"] = _layout_from_snap(snap)
         return JSONResponse(content=snap)
 
     @app.get("/api/stats")
@@ -168,11 +164,7 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
             return JSONResponse({"error": "No text provided"}, status_code=400)
         result = engine.nl(text)
         snap = engine.snapshot()
-        layout = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
-        snap["layout"] = layout
+        snap["layout"] = _layout_from_snap(snap)
         return JSONResponse({"result": result, "snapshot": snap})
 
     @app.post("/api/zoom")
@@ -199,11 +191,7 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
         expr = body.get("expression", "")
         results = engine.query(expr)
         snap = engine.snapshot()
-        layout = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
-        snap["layout"] = layout
+        snap["layout"] = _layout_from_snap(snap)
         return JSONResponse({"results": results, "snapshot": snap})
 
     @app.post("/api/propose")
@@ -231,11 +219,7 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
         edge_types = body.get("edge_types")
         result = engine.isolate(target, level=level, depth=depth, edge_types=edge_types)
         snap = engine.snapshot()
-        layout = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
-        snap["layout"] = layout
+        snap["layout"] = _layout_from_snap(snap)
         return JSONResponse({"result": result, "snapshot": snap})
 
     @app.post("/api/find_duplicates")
@@ -244,11 +228,7 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
         scope = body.get("scope")
         result = engine.find_duplicates(threshold=threshold, scope=scope)
         snap = engine.snapshot()
-        layout = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
-        snap["layout"] = layout
+        snap["layout"] = _layout_from_snap(snap)
         return JSONResponse({"result": result, "snapshot": snap})
 
     @app.post("/api/similar_to")
@@ -257,11 +237,7 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
         threshold = body.get("threshold", 0.5)
         result = engine.similar_to(target, threshold=threshold)
         snap = engine.snapshot()
-        layout = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
-        snap["layout"] = layout
+        snap["layout"] = _layout_from_snap(snap)
         return JSONResponse({"result": result, "snapshot": snap})
 
     @app.post("/api/get_context")
@@ -281,11 +257,7 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
         origin = body.get("origin")
         result = engine.trace_variable(var_name, origin)
         snap = engine.snapshot()
-        layout = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
-        snap["layout"] = layout
+        snap["layout"] = _layout_from_snap(snap)
         return JSONResponse({"result": result, "snapshot": snap})
 
     # ── LLM chat + settings ──────────────────────────────────────
@@ -333,11 +305,7 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
 
         # Always return fresh snapshot after commands have executed
         snap = engine.snapshot()
-        layout = compute_layout(
-            [n for n in graph.all_nodes()],
-            graph.all_edges(),
-        )
-        snap["layout"] = layout
+        snap["layout"] = _layout_from_snap(snap)
         result["snapshot"] = snap
 
         return JSONResponse(result)
