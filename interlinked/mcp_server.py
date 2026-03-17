@@ -67,25 +67,18 @@ def create_mcp_server(project_path: str) -> Server:
     to parse, which exceeds Windsurf's startup timeout).
     """
     # Lazy state — built on first tool call (only if no web server is running)
-    _state: dict[str, Any] = {
-        "graph": None, "engine": None, "ready": False,
-        "server_url": None, "server_checked": False,
-    }
+    _state: dict[str, Any] = {"graph": None, "engine": None, "ready": False}
 
     def _check_server(port: int = 8420) -> str | None:
-        """Check if the web visualizer is running. Returns base URL or None."""
-        if _state["server_checked"]:
-            return _state["server_url"]
+        """Check if the web visualizer is running right now. Returns base URL or None."""
         url = f"http://127.0.0.1:{port}"
         try:
             r = httpx.get(f"{url}/api/stats", timeout=1.0)
             if r.status_code == 200:
-                _state["server_url"] = url
-                print(f"Connected to visualizer at {url}", file=sys.stderr)
+                return url
         except Exception:
             pass
-        _state["server_checked"] = True
-        return _state["server_url"]
+        return None
 
     def _ensure_ready() -> tuple[CodeGraph, QueryEngine]:
         if not _state["ready"]:
