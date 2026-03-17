@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ast
 import builtins
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -56,7 +57,9 @@ def parse_project(root: str | Path) -> tuple[list[NodeData], list[EdgeData]]:
     for py_file in py_files:
         try:
             source = py_file.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(source, filename=str(py_file))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SyntaxWarning)
+                tree = ast.parse(source, filename=str(py_file))
         except SyntaxError:
             continue
 

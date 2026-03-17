@@ -45,6 +45,7 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
     """Create and configure the FastAPI application."""
     app = FastAPI(title="Interlinked", version="0.1.0")
     engine = QueryEngine(graph)
+
     llm = LLMAdapter(engine)
     app_state = {"project_path": initial_path or ""}
     sse_queues: list[asyncio.Queue] = []

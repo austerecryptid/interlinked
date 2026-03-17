@@ -43,7 +43,7 @@ def compute_layout(
     elif algorithm == "circular":
         pos = _circular_layout(nodes)
     else:
-        pos = _force_layout(nodes, edges, iterations=80)
+        pos = _force_layout(nodes, edges)
 
     # Scale to canvas dimensions
     result: dict[str, dict[str, float]] = {}
@@ -68,10 +68,10 @@ def compute_layout(
 def _force_layout(
     nodes: list[NodeData],
     edges: list[EdgeData],
-    iterations: int = 80,
 ) -> dict[str, tuple[float, float]]:
-    """Pure-Python Fruchterman-Reingold force-directed layout."""
-    rng = random.Random(42)
+    """Force-directed layout using networkx (numpy-accelerated)."""
+    import networkx as nx
+
     node_ids = [n.id for n in nodes]
     n = len(node_ids)
     if n == 0:
@@ -79,69 +79,20 @@ def _force_layout(
     if n == 1:
         return {node_ids[0]: (0.0, 0.0)}
 
-    idx = {nid: i for i, nid in enumerate(node_ids)}
     id_set = set(node_ids)
 
-    # Initial random positions
-    px = [rng.uniform(-1.0, 1.0) for _ in range(n)]
-    py = [rng.uniform(-1.0, 1.0) for _ in range(n)]
-
-    # Build adjacency
-    adj: list[list[int]] = [[] for _ in range(n)]
+    G = nx.Graph()
+    G.add_nodes_from(node_ids)
     for e in edges:
         if e.source in id_set and e.target in id_set:
-            si, ti = idx[e.source], idx[e.target]
-            adj[si].append(ti)
-            adj[ti].append(si)
+            G.add_edge(e.source, e.target)
 
-    area = 4.0 * n
-    k = math.sqrt(area / max(n, 1))
-    temp = 1.0
+    # Scale iterations: fewer for larger graphs (still fast with numpy)
+    iters = 50 if n < 1000 else 20 if n < 10000 else 10
+    k = math.sqrt(4.0 / max(n, 1))
 
-    for iteration in range(iterations):
-        # Repulsive forces between all pairs
-        dx = [0.0] * n
-        dy = [0.0] * n
-
-        for i in range(n):
-            for j in range(i + 1, n):
-                ddx = px[i] - px[j]
-                ddy = py[i] - py[j]
-                dist = math.sqrt(ddx * ddx + ddy * ddy) or 0.001
-                force = (k * k) / dist
-                fx = (ddx / dist) * force
-                fy = (ddy / dist) * force
-                dx[i] += fx
-                dy[i] += fy
-                dx[j] -= fx
-                dy[j] -= fy
-
-        # Attractive forces along edges
-        for i in range(n):
-            for j in adj[i]:
-                if j <= i:
-                    continue
-                ddx = px[i] - px[j]
-                ddy = py[i] - py[j]
-                dist = math.sqrt(ddx * ddx + ddy * ddy) or 0.001
-                force = (dist * dist) / k
-                fx = (ddx / dist) * force
-                fy = (ddy / dist) * force
-                dx[i] -= fx
-                dy[i] -= fy
-                dx[j] += fx
-                dy[j] += fy
-
-        # Apply with temperature
-        for i in range(n):
-            disp = math.sqrt(dx[i] * dx[i] + dy[i] * dy[i]) or 0.001
-            scale = min(disp, temp) / disp
-            px[i] += dx[i] * scale
-            py[i] += dy[i] * scale
-
-        temp *= 0.95  # cooling
-
-    return {node_ids[i]: (px[i], py[i]) for i in range(n)}
+    pos = nx.spring_layout(G, k=k, iterations=iters, seed=42)
+    return {nid: (float(xy[0]), float(xy[1])) for nid, xy in pos.items()}
 
 
 def _hierarchical_layout(
