@@ -1,0 +1,2137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>INTERLINKED</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/d3@7/dist/d3.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;500;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg-void: #000000;
+    --bg-panel: #0a0a12;
+    --bg-panel-alt: #0d0d1a;
+    --border-grid: #1a3a5c;
+    --border-bright: #00d4ff44;
+    --neon-cyan: #00d4ff;
+    --neon-orange: #ff6a00;
+    --neon-magenta: #ff2975;
+    --neon-green: #39ff14;
+    --neon-yellow: #ffe600;
+    --neon-purple: #bf5af2;
+    --neon-white: #e0f0ff;
+    --neon-dim: #4a7a9a;
+    --text-primary: #c0dff0;
+    --text-secondary: #5a8aaa;
+    --text-muted: #2a4a6a;
+    --glow-cyan: 0 0 8px #00d4ff88, 0 0 20px #00d4ff33;
+    --glow-orange: 0 0 8px #ff6a0088, 0 0 20px #ff6a0033;
+    --glow-magenta: 0 0 8px #ff297588, 0 0 20px #ff297533;
+    --glow-green: 0 0 8px #39ff1488, 0 0 20px #39ff1433;
+  }
+
+  @keyframes scanline {
+    0% { transform: translateY(-100%); }
+    100% { transform: translateY(100vh); }
+  }
+
+  @keyframes flicker {
+    0%, 100% { opacity: 1; }
+    92% { opacity: 1; }
+    93% { opacity: 0.8; }
+    94% { opacity: 1; }
+    96% { opacity: 0.9; }
+    97% { opacity: 1; }
+  }
+
+  @keyframes pulse-glow {
+    0%, 100% { filter: brightness(1); }
+    50% { filter: brightness(1.3); }
+  }
+
+  @keyframes grid-scroll {
+    0% { background-position: 0 0; }
+    100% { background-position: 0 50px; }
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Share Tech Mono', 'Courier New', monospace;
+    background: var(--bg-void);
+    color: var(--text-primary);
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+    animation: flicker 8s infinite;
+  }
+
+  /* CRT scanline overlay */
+  body::after {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0, 212, 255, 0.015) 2px,
+      rgba(0, 212, 255, 0.015) 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  #root { height: 100%; width: 100%; }
+
+  .app-container {
+    display: grid;
+    grid-template-columns: 260px 1fr 320px;
+    grid-template-rows: 60px 1fr 48px;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  /* ── Header ───────────────────────────────────────────── */
+  .header {
+    grid-column: 1 / -1;
+    background: var(--bg-panel);
+    border-bottom: 1px solid var(--border-grid);
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    gap: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .header::before {
+    content: '';
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+    box-shadow: var(--glow-cyan);
+  }
+
+  .header .logo {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 18px;
+    font-weight: 900;
+    letter-spacing: 6px;
+    color: var(--neon-cyan);
+    text-shadow: var(--glow-cyan);
+    text-transform: uppercase;
+  }
+
+  .header .logo-sub {
+    font-size: 9px;
+    letter-spacing: 3px;
+    color: var(--text-muted);
+    font-family: 'Orbitron', sans-serif;
+    margin-left: -2px;
+  }
+
+  .header .separator {
+    width: 1px;
+    height: 30px;
+    background: linear-gradient(180deg, transparent, var(--border-grid), transparent);
+  }
+
+  .header .stats {
+    display: flex;
+    gap: 18px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    letter-spacing: 1px;
+  }
+
+  .header .stats .stat-value {
+    color: var(--neon-cyan);
+    font-weight: 700;
+    margin-left: 4px;
+    text-shadow: 0 0 6px #00d4ff66;
+  }
+
+  .header .stats .stat-dead {
+    color: var(--neon-magenta);
+    text-shadow: 0 0 6px #ff297566;
+  }
+
+  .zoom-controls {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .zoom-btn {
+    padding: 7px 16px;
+    border: 1px solid var(--border-grid);
+    background: transparent;
+    color: var(--text-secondary);
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 11px;
+    font-family: 'Orbitron', sans-serif;
+    font-weight: 500;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    transition: all 0.2s;
+  }
+
+  .zoom-btn:hover {
+    border-color: var(--neon-cyan);
+    color: var(--neon-cyan);
+    text-shadow: 0 0 8px #00d4ff66;
+    box-shadow: inset 0 0 20px #00d4ff11;
+  }
+
+  .zoom-btn.active {
+    background: #00d4ff11;
+    border-color: var(--neon-cyan);
+    color: var(--neon-cyan);
+  }
+
+  .edge-chip {
+    padding: 4px 10px;
+    border: 1px solid #333;
+    background: transparent;
+    color: #667;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 8px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    cursor: pointer;
+    border-radius: 3px;
+    transition: all 0.2s;
+    text-transform: uppercase;
+    opacity: 0.4;
+  }
+  .edge-chip:hover { opacity: 0.7; }
+  .edge-chip.active {
+    opacity: 1;
+    text-shadow: 0 0 6px currentColor;
+    box-shadow: 0 0 10px #00d4ff11, inset 0 0 20px #00d4ff08;
+  }
+
+  /* ── Sidebar (left) ───────────────────────────────────── */
+  .sidebar-left {
+    background: var(--bg-panel);
+    border-right: 1px solid var(--border-grid);
+    overflow-y: auto;
+    padding: 10px 8px;
+    position: relative;
+  }
+
+  .sidebar-left::after {
+    content: '';
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    width: 1px;
+    background: linear-gradient(180deg, var(--neon-cyan), transparent 30%, transparent 70%, var(--neon-cyan));
+    opacity: 0.3;
+  }
+
+  .sidebar-section { margin-bottom: 14px; }
+
+  .sidebar-section-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 3px;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+    padding: 4px 8px;
+    border-left: 2px solid var(--neon-cyan);
+  }
+
+  .node-list-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px;
+    border-radius: 2px;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-secondary);
+    transition: all 0.15s;
+    border: 1px solid transparent;
+  }
+
+  .node-list-item:hover {
+    background: #00d4ff08;
+    border-color: #00d4ff22;
+    color: var(--neon-white);
+  }
+
+  .node-list-item.active {
+    background: #00d4ff11;
+    border-color: var(--neon-cyan);
+    color: var(--neon-cyan);
+    text-shadow: 0 0 4px #00d4ff44;
+  }
+
+  .node-badge {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 8px;
+    font-weight: 700;
+    padding: 2px 5px;
+    border-radius: 2px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    flex-shrink: 0;
+    border: 1px solid;
+  }
+
+  .node-badge.module { border-color: #00d4ff55; color: var(--neon-cyan); background: #00d4ff11; }
+  .node-badge.class { border-color: #bf5af255; color: var(--neon-purple); background: #bf5af211; }
+  .node-badge.function { border-color: #ff6a0055; color: var(--neon-orange); background: #ff6a0011; }
+  .node-badge.method { border-color: #ffe60055; color: var(--neon-yellow); background: #ffe60011; }
+  .node-badge.variable { border-color: #4a7a9a55; color: var(--neon-dim); background: #4a7a9a11; }
+
+  .node-name {
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .dead-indicator {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--neon-magenta);
+    margin-left: auto;
+    flex-shrink: 0;
+    box-shadow: 0 0 6px var(--neon-magenta);
+    animation: pulse-glow 2s infinite;
+  }
+
+  .proposed-indicator {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--neon-green);
+    margin-left: auto;
+    flex-shrink: 0;
+    box-shadow: 0 0 6px var(--neon-green);
+    animation: pulse-glow 1.5s infinite;
+  }
+
+  /* ── Graph Canvas ─────────────────────────────────────── */
+  .graph-container {
+    position: relative;
+    overflow: hidden;
+    background: var(--bg-void);
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Tron grid background */
+  .graph-container::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background:
+      linear-gradient(var(--border-grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border-grid) 1px, transparent 1px);
+    background-size: 50px 50px;
+    opacity: 0.25;
+    animation: grid-scroll 8s linear infinite;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* Horizon glow at bottom */
+  .graph-container::after {
+    content: '';
+    position: absolute;
+    bottom: 0; left: 0; right: 0;
+    height: 120px;
+    background: linear-gradient(0deg, #00d4ff08, transparent);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .graph-container svg {
+    width: 100%;
+    flex: 1 1 0;
+    min-height: 0;
+    position: relative;
+    z-index: 1;
+  }
+
+  .context-banner {
+    position: absolute;
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 20;
+    background: #0a0c14ee;
+    border: 1px solid #00d4ff33;
+    border-radius: 6px;
+    padding: 12px 20px;
+    max-width: 600px;
+    min-width: 280px;
+    backdrop-filter: blur(12px);
+    box-shadow: 0 4px 30px #00000066, 0 0 20px #00d4ff11;
+    pointer-events: auto;
+  }
+  .context-banner .cb-dismiss {
+    position: absolute; top: 6px; right: 10px;
+    background: none; border: none; color: #556; cursor: pointer;
+    font-size: 14px; line-height: 1;
+  }
+  .context-banner .cb-dismiss:hover { color: #aaa; }
+  .context-banner .cb-row {
+    display: flex; gap: 8px; align-items: baseline;
+    margin-bottom: 4px; line-height: 1.5;
+  }
+  .context-banner .cb-row:last-child { margin-bottom: 0; }
+  .context-banner .cb-label {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 8px; font-weight: 700; letter-spacing: 2px;
+    color: #00d4ff; flex-shrink: 0; min-width: 42px;
+    text-shadow: 0 0 6px #00d4ff44;
+  }
+  .context-banner .cb-text {
+    font-size: 11px; color: #ccd; line-height: 1.5;
+  }
+  .context-banner .cb-source {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 7px; letter-spacing: 2px;
+    color: #556; margin-top: 6px; text-align: right;
+  }
+
+  .graph-container .edge {
+    stroke-width: 1.2;
+    fill: none;
+    opacity: 0.45;
+    transition: opacity 0.2s;
+  }
+
+  .graph-container .edge:hover { opacity: 1; stroke-width: 2.5; }
+  .graph-container .edge.highlighted { opacity: 0.9; stroke-width: 2.5; }
+  .graph-container .edge.dead { stroke-dasharray: 6 4; opacity: 0.35; }
+  .graph-container .edge.proposed { stroke-dasharray: 8 4; stroke-width: 2; }
+
+  .graph-container .node-group { cursor: pointer; }
+  .graph-container .node-group:hover .node-circle { filter: brightness(1.5) drop-shadow(0 0 8px currentColor); }
+
+  .graph-container .node-circle {
+    stroke: none;
+    transition: all 0.2s;
+    filter: drop-shadow(0 0 4px currentColor);
+  }
+
+  .graph-container .node-circle.highlighted {
+    stroke: var(--neon-yellow);
+    stroke-width: 3;
+    filter: drop-shadow(0 0 12px var(--neon-yellow));
+  }
+
+  .graph-container .node-circle.dead {
+    stroke: var(--neon-magenta);
+    stroke-width: 2;
+    stroke-dasharray: 4 3;
+  }
+
+  .graph-container .node-circle.proposed {
+    stroke: var(--neon-green);
+    stroke-width: 2.5;
+    stroke-dasharray: 6 3;
+    filter: drop-shadow(0 0 10px var(--neon-green));
+  }
+
+  .graph-container .node-label {
+    fill: var(--neon-white);
+    font-size: 10px;
+    font-family: 'Share Tech Mono', monospace;
+    font-weight: 400;
+    text-anchor: middle;
+    pointer-events: none;
+    filter: drop-shadow(0 0 3px rgba(0,0,0,0.9));
+  }
+
+  /* ── Right Panel ──────────────────────────────────────── */
+  .sidebar-right {
+    background: var(--bg-panel);
+    border-left: 1px solid var(--border-grid);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .sidebar-right::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; bottom: 0;
+    width: 1px;
+    background: linear-gradient(180deg, var(--neon-cyan), transparent 30%, transparent 70%, var(--neon-cyan));
+    opacity: 0.3;
+  }
+
+  .detail-panel {
+    flex: 1;
+    overflow-y: auto;
+    padding: 14px;
+  }
+
+  .detail-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    margin-bottom: 14px;
+    color: var(--neon-cyan);
+    text-shadow: var(--glow-cyan);
+    text-transform: uppercase;
+  }
+
+  .detail-field { margin-bottom: 10px; }
+
+  .detail-label {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 8px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    color: var(--text-muted);
+    margin-bottom: 3px;
+  }
+
+  .detail-value {
+    font-size: 11px;
+    color: var(--text-secondary);
+    word-break: break-all;
+  }
+
+  .detail-value code {
+    background: #00d4ff0a;
+    border: 1px solid #00d4ff22;
+    padding: 2px 6px;
+    border-radius: 2px;
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 10px;
+    color: var(--neon-cyan);
+  }
+
+  .connections-list { list-style: none; margin-top: 4px; }
+
+  .connections-list li {
+    font-size: 10px;
+    padding: 3px 0;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: color 0.1s;
+  }
+
+  .connections-list li:hover { color: var(--neon-cyan); text-shadow: 0 0 4px #00d4ff44; }
+
+  .edge-type-badge {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 7px;
+    padding: 1px 5px;
+    border-radius: 2px;
+    margin-right: 6px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    border: 1px solid;
+  }
+
+  /* ── Command Bar ──────────────────────────────────────── */
+  .command-bar {
+    border-top: 1px solid var(--border-grid);
+    padding: 10px 14px;
+    background: var(--bg-panel-alt);
+    position: relative;
+  }
+
+  .command-bar::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--neon-orange), transparent);
+    opacity: 0.4;
+  }
+
+  .command-input-wrapper {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg-void);
+    border: 1px solid var(--border-grid);
+    border-radius: 2px;
+    padding: 0 12px;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+
+  .command-input-wrapper:focus-within {
+    border-color: var(--neon-orange);
+    box-shadow: 0 0 15px #ff6a0022, inset 0 0 20px #ff6a0008;
+  }
+
+  .command-prefix {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    color: var(--neon-orange);
+    font-weight: 700;
+    flex-shrink: 0;
+    text-shadow: 0 0 6px #ff6a0066;
+  }
+
+  .command-input {
+    flex: 1;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--neon-white);
+    font-family: 'Share Tech Mono', monospace;
+    font-size: 12px;
+    padding: 10px 0;
+    letter-spacing: 0.5px;
+  }
+
+  .command-input::placeholder { color: var(--text-muted); }
+
+  /* ── Status Bar ───────────────────────────────────────── */
+  .status-bar {
+    grid-column: 1 / -1;
+    background: var(--bg-panel);
+    border-top: 1px solid var(--border-grid);
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    font-size: 10px;
+    color: var(--text-muted);
+    gap: 16px;
+    letter-spacing: 1px;
+    position: relative;
+  }
+
+  .status-bar::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--neon-cyan), transparent);
+    opacity: 0.2;
+  }
+
+  .status-bar .status-msg {
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--text-secondary);
+  }
+
+  .status-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--neon-green);
+    box-shadow: 0 0 6px var(--neon-green);
+  }
+
+  /* ── Legend ───────────────────────────────────────────── */
+  .legend-bar {
+    flex-shrink: 0;
+    z-index: 20;
+    background: rgba(4, 6, 14, 0.95);
+    border-top: 1px solid var(--border-grid);
+    padding: 12px 30px;
+    display: flex;
+    justify-content: space-evenly;
+    align-items: flex-start;
+  }
+  .legend-bar.collapsed {
+    padding: 4px 20px;
+    cursor: pointer;
+    justify-content: center;
+  }
+  .legend-group {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .legend-group-title {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 8px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    color: var(--neon-cyan);
+    text-transform: uppercase;
+    text-shadow: 0 0 6px var(--neon-cyan);
+    margin-bottom: 2px;
+  }
+  .legend-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    font-family: 'Share Tech Mono', monospace;
+    white-space: nowrap;
+  }
+  .legend-collapse-btn {
+    position: absolute;
+    top: 2px;
+    right: 10px;
+    background: none;
+    border: 1px solid var(--border-grid);
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 10px;
+    padding: 2px 8px;
+    border-radius: 2px;
+    font-family: 'Orbitron', sans-serif;
+    letter-spacing: 1px;
+    z-index: 12;
+  }
+  .legend-collapse-btn:hover { color: var(--neon-cyan); border-color: var(--neon-cyan); }
+
+  /* ── Collapsible panels ─────────────────────────────── */
+  .panel-collapse-btn {
+    position: absolute;
+    z-index: 5;
+    background: rgba(4, 6, 14, 0.9);
+    border: 1px solid var(--border-grid);
+    color: var(--text-muted);
+    cursor: pointer;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 10px;
+    letter-spacing: 1px;
+    padding: 4px 6px;
+    border-radius: 3px;
+  }
+  .panel-collapse-btn:hover { color: var(--neon-cyan); border-color: var(--neon-cyan); }
+
+  /* ── Empty State / Meme ───────────────────────────────── */
+  .empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 20px;
+  }
+
+  .empty-state .gosling-quote {
+    font-family: 'Orbitron', sans-serif;
+    font-size: 11px;
+    letter-spacing: 3px;
+    color: var(--neon-cyan);
+    text-shadow: var(--glow-cyan);
+    margin-bottom: 16px;
+    text-transform: uppercase;
+    max-width: 220px;
+    line-height: 1.8;
+  }
+
+  .empty-state .gosling-sub {
+    font-size: 10px;
+    color: var(--text-muted);
+    letter-spacing: 1px;
+  }
+
+  .interlinked-watermark {
+    position: absolute;
+    bottom: 20px;
+    right: 20px;
+    font-family: 'Orbitron', sans-serif;
+    font-size: 40px;
+    font-weight: 900;
+    letter-spacing: 8px;
+    color: #00d4ff06;
+    text-transform: uppercase;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ── Radio Player ──────────────────────────────────────── */
+  @keyframes marquee {
+    0% { transform: translateX(100%); }
+    100% { transform: translateX(-100%); }
+  }
+
+  .radio-container {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .radio-station-select {
+    background: var(--bg-void);
+    border: 1px solid var(--border-grid);
+    border-radius: 2px;
+    color: var(--neon-purple);
+    font-family: 'Orbitron', sans-serif;
+    font-size: 8px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    padding: 4px 8px;
+    outline: none;
+    cursor: pointer;
+    text-transform: uppercase;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    max-width: 120px;
+  }
+
+  .radio-station-select:focus {
+    border-color: var(--neon-purple);
+    box-shadow: 0 0 8px #bf5af222;
+  }
+
+  .radio-station-select option {
+    background: var(--bg-panel);
+    color: var(--text-primary);
+  }
+
+  .radio-play-btn {
+    width: 28px; height: 28px;
+    border: 1px solid var(--border-grid);
+    border-radius: 50%;
+    background: transparent;
+    color: var(--neon-purple);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    transition: all 0.2s;
+    flex-shrink: 0;
+  }
+
+  .radio-play-btn:hover {
+    border-color: var(--neon-purple);
+    box-shadow: 0 0 12px #bf5af233;
+    color: #e0aaff;
+  }
+
+  .radio-play-btn.playing {
+    border-color: var(--neon-purple);
+    background: #bf5af211;
+    box-shadow: 0 0 12px #bf5af233, inset 0 0 15px #bf5af211;
+  }
+
+  .radio-volume {
+    -webkit-appearance: none;
+    width: 60px;
+    height: 3px;
+    background: var(--border-grid);
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+  }
+
+  .radio-volume::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--neon-purple);
+    box-shadow: 0 0 6px #bf5af266;
+    cursor: pointer;
+  }
+
+  .radio-volume::-moz-range-thumb {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--neon-purple);
+    box-shadow: 0 0 6px #bf5af266;
+    border: none;
+    cursor: pointer;
+  }
+
+  .radio-nowplaying {
+    overflow: hidden;
+    white-space: nowrap;
+    max-width: 260px;
+    min-width: 100px;
+    flex-shrink: 1;
+    position: relative;
+    height: 16px;
+    mask-image: linear-gradient(90deg, transparent, black 8%, black 92%, transparent);
+    -webkit-mask-image: linear-gradient(90deg, transparent, black 8%, black 92%, transparent);
+  }
+
+  .radio-nowplaying-text {
+    display: inline-block;
+    font-size: 9px;
+    font-family: 'Share Tech Mono', monospace;
+    letter-spacing: 1px;
+    color: var(--neon-purple);
+    text-shadow: 0 0 6px #bf5af244;
+    animation: marquee 18s linear infinite;
+    position: absolute;
+    top: 2px;
+    white-space: nowrap;
+  }
+
+  /* ── Scrollbar ────────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border-grid); border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--neon-cyan); }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ── Visual System ──────────────────────────────────────────────
+// Three distinct visual channels: SHAPE + COLOR + LINE STYLE
+// Color families are intentionally non-overlapping across categories.
+
+// NODES — color + shape (shape paths defined in NODE_SHAPES)
+const NODE_COLORS = {
+  module:    '#0099dd',  // steel blue
+  class:     '#cc44ff',  // vivid purple
+  function:  '#ff8822',  // warm orange
+  method:    '#ddaa00',  // gold
+  variable:  '#55aacc',  // cool teal
+  parameter: '#44ddcc',  // bright cyan
+};
+const NODE_SIZES = { module: 22, class: 16, function: 11, method: 9, variable: 7, parameter: 5 };
+
+// SVG path generators for distinct shapes (centered at 0,0)
+const NODE_SHAPES = {
+  module: (r) => {  // hexagon
+    const a = r, h = a * Math.sqrt(3) / 2;
+    return `M${-a},0 L${-a/2},${-h} L${a/2},${-h} L${a},0 L${a/2},${h} L${-a/2},${h} Z`;
+  },
+  class: (r) => {  // diamond
+    return `M0,${-r} L${r},0 L0,${r} L${-r},0 Z`;
+  },
+  function: (r) => {  // circle (via polygon approximation for consistency)
+    const pts = []; for (let i = 0; i < 16; i++) { const a = (i/16)*Math.PI*2; pts.push(`${Math.cos(a)*r},${Math.sin(a)*r}`); }
+    return `M${pts.join('L')}Z`;
+  },
+  method: (r) => {  // circle (smaller)
+    const pts = []; for (let i = 0; i < 16; i++) { const a = (i/16)*Math.PI*2; pts.push(`${Math.cos(a)*r},${Math.sin(a)*r}`); }
+    return `M${pts.join('L')}Z`;
+  },
+  variable: (r) => {  // rounded square
+    const s = r * 0.85, c = r * 0.2;
+    return `M${-s+c},${-s} L${s-c},${-s} Q${s},${-s} ${s},${-s+c} L${s},${s-c} Q${s},${s} ${s-c},${s} L${-s+c},${s} Q${-s},${s} ${-s},${s-c} L${-s},${-s+c} Q${-s},${-s} ${-s+c},${-s} Z`;
+  },
+  parameter: (r) => {  // small triangle (pointing up)
+    return `M0,${-r} L${r},${r*0.7} L${-r},${r*0.7} Z`;
+  },
+};
+
+// EDGES — each type has a unique color + dash pattern
+const EDGE_COLORS = {
+  calls:    '#88bbdd',  // pale blue — most common, stays neutral
+  imports:  '#667799',  // slate
+  inherits: '#bb77ee',  // light violet
+  contains: '#334455',  // very faint
+  reads:    '#33ccaa',  // bright teal
+  writes:   '#ff5566',  // coral red
+  proposed: '#39ff14',  // neon green
+  returns:  '#eebb44',  // amber — return value flow
+};
+const EDGE_DASH = {
+  calls:    null,       // solid — the default
+  imports:  '8,4',      // dashed
+  inherits: '3,3',      // dotted
+  contains: '2,6',      // sparse dots
+  reads:    '12,3,3,3', // dash-dot
+  writes:   null,       // solid (thick)
+  proposed: '6,3',      // dashed
+  returns:  '15,5',     // long dash
+};
+const EDGE_WIDTH = {
+  calls:    1.2,
+  imports:  1.0,
+  inherits: 1.5,
+  contains: 0.5,
+  reads:    1.0,
+  writes:   2.0,
+  proposed: 1.5,
+  returns:  1.3,
+};
+
+// TRACE ROLES — bright neon, unmistakable (separate visual layer)
+const TRACE_ROLE_COLORS = {
+  origin:      '#00ff88',  // neon green — where the variable is born
+  mutator:     '#ff2244',  // hot red — writes/mutates
+  passthrough: '#ffcc00',  // bright yellow — reads and forwards
+  destination: '#ffffff',  // white — terminal consumer
+};
+const TRACE_EDGE_COLORS = {
+  write: '#ff2244',  // hot red — mutation edge
+  read:  '#33ccaa',  // teal — non-mutating read
+  flow:  '#88bbdd',  // pale blue — calls / structural link
+};
+
+const RADIO_STATIONS = [
+  { id: 'vaporwaves', name: 'SomaFM Vaporwaves', url: 'https://ice6.somafm.com/vaporwaves-128-mp3', nowPlayingUrl: 'https://api.somafm.com/songs/vaporwaves.json', parser: 'somafm' },
+  { id: 'plaza', name: 'Nightwave Plaza', url: 'https://radio.plaza.one/mp3', nowPlayingUrl: 'https://api.plaza.one/status', parser: 'plaza' },
+  { id: 'nightride', name: 'Nightride FM', url: 'https://stream.nightride.fm/nightride.mp3', nowPlayingUrl: null, parser: null },
+  { id: 'chillsynth', name: 'Chillsynth FM', url: 'https://stream.nightride.fm/chillsynth.mp3', nowPlayingUrl: null, parser: null },
+  { id: 'darksynth', name: 'Darksynth FM', url: 'https://stream.nightride.fm/darksynth.mp3', nowPlayingUrl: null, parser: null },
+  { id: 'datawave', name: 'Datawave FM', url: 'https://stream.nightride.fm/datawave.mp3', nowPlayingUrl: null, parser: null },
+];
+
+const GOSLING_QUOTES = [
+  ["INTERLINKED", "WITHIN CELLS INTERLINKED"],
+  ["WHAT'S IT LIKE TO HOLD\nTHE HAND OF SOMEONE\nYOU LOVE?", "INTERLINKED"],
+  ["DO YOU FEEL THAT\nTHERE'S A PART OF YOU\nTHAT'S MISSING?", "INTERLINKED"],
+  ["CELLS", "WITHIN CELLS INTERLINKED"],
+  ["HAVE YOU EVER BEEN\nIN AN INSTITUTION?", "CELLS"],
+  ["DREADFULLY", "DISTINCT"],
+  ["DO YOU DREAM ABOUT\nBEING INTERLINKED?", "..."],
+  ["WHAT'S IT LIKE TO HOLD\nTHE HAND OF SOMEONE\nYOU LOVE?", "DO YOU LONG FOR\nHAVING YOUR HEART\nINTERLINKED?"],
+  ["A TALL WHITE FOUNTAIN\nPLAYED", "INTERLINKED"],
+  ["WITHIN CELLS\nINTERLINKED", "WITHIN CELLS\nINTERLINKED"],
+  ["AND BLOOD-BLACK\nNOTHINGNESS BEGAN\nTO SPIN", "INTERLINKED"],
+  ["CONSTANT K", "BASELINE"],
+];
+
+function App() {
+  const [snapshot, setSnapshot] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [selectedNode, setSelectedNode] = useState(null);
+  const [statusMsg, setStatusMsg] = useState('ESTABLISHING UPLINK...');
+  const [commandHistory, setCommandHistory] = useState([]);
+  const [historyIdx, setHistoryIdx] = useState(-1);
+  const [rightTab, setRightTab] = useState('inspect'); // 'inspect' | 'chat' | 'settings'
+  const [chatMessages, setChatMessages] = useState([]);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [hasApiKey, setHasApiKey] = useState(false);
+  const [llmModel, setLlmModel] = useState('claude-sonnet-4-20250514');
+  const commandRef = useRef(null);
+  const chatInputRef = useRef(null);
+  const chatScrollRef = useRef(null);
+
+  // Fetch initial data + settings
+  useEffect(() => {
+    fetch('/api/snapshot').then(r => r.json()).then(data => {
+      setSnapshot(data);
+      setStatusMsg(`ONLINE // ${data.nodes?.length || 0} NODES // ${data.edges?.length || 0} EDGES`);
+    }).catch(() => setStatusMsg('UPLINK FAILED'));
+    fetch('/api/stats').then(r => r.json()).then(setStats);
+    fetch('/api/settings').then(r => r.json()).then(data => {
+      setHasApiKey(data.has_api_key);
+      setLlmModel(data.model);
+    });
+
+    // SSE — persistent one-way stream, works through any proxy
+    const evtSource = new EventSource('/api/events');
+    evtSource.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'snapshot') {
+          setSnapshot(msg.data);
+          setStatusMsg(`SYNCED // ${msg.data.nodes?.length || 0} NODES // ${msg.data.edges?.length || 0} EDGES`);
+          fetch('/api/stats').then(r => r.json()).then(setStats).catch(() => {});
+        }
+      } catch (e) { /* ignore keepalive / malformed */ }
+    };
+    evtSource.onopen = () => setStatusMsg('UPLINK ESTABLISHED');
+    evtSource.onerror = () => setStatusMsg('UPLINK RECONNECTING...');
+    return () => evtSource.close();
+  }, []);
+
+  // Auto-scroll chat
+  useEffect(() => {
+    if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+  }, [chatMessages]);
+
+  const refreshView = useCallback(() => {
+    fetch('/api/snapshot').then(r => r.json()).then(setSnapshot);
+    fetch('/api/stats').then(r => r.json()).then(setStats);
+  }, []);
+
+  // Direct Python command (command bar)
+  const sendCommand = useCallback((cmd) => {
+    if (!cmd.trim()) return;
+    setCommandHistory(h => [cmd, ...h].slice(0, 50));
+    setHistoryIdx(-1);
+    const isPython = cmd.includes('view.') || cmd.includes('graph.') || cmd.includes('=') || cmd.includes('(');
+    const endpoint = isPython ? '/api/command' : '/api/nl';
+    const body = isPython ? { command: cmd } : { text: cmd };
+
+    fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json()).then(data => {
+      if (data.error) {
+        setStatusMsg(`ERR: ${data.error}`.toUpperCase());
+      } else {
+        const msg = data.result || JSON.stringify(data).slice(0, 200);
+        setStatusMsg(typeof msg === 'string' ? msg.toUpperCase() : String(msg).toUpperCase());
+        if (data.snapshot) setSnapshot(data.snapshot);
+        refreshView();
+      }
+    });
+  }, [refreshView]);
+
+  // Chat message (goes through Claude)
+  const sendChat = useCallback((text) => {
+    if (!text.trim()) return;
+    setChatMessages(msgs => [...msgs, { role: 'user', content: text }]);
+    setChatLoading(true);
+
+    fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: text }),
+    }).then(r => r.json()).then(data => {
+      setChatLoading(false);
+      if (data.error === 'no_api_key') {
+        setChatMessages(msgs => [...msgs, {
+          role: 'system',
+          content: 'No API key configured. Go to Settings tab to add your Anthropic API key, or use the command bar (>_) with Python commands like view.isolate("analyzer")'
+        }]);
+        return;
+      }
+      const explanation = data.explanation || 'Done.';
+      const cmds = data.commands_run || [];
+      setChatMessages(msgs => [...msgs, {
+        role: 'assistant',
+        content: explanation,
+        commands: cmds,
+      }]);
+      if (data.snapshot) setSnapshot(data.snapshot);
+      refreshView();
+    }).catch(err => {
+      setChatLoading(false);
+      setChatMessages(msgs => [...msgs, { role: 'system', content: `Error: ${err.message}` }]);
+    });
+  }, [refreshView]);
+
+  const handleKeyDown = useCallback((e) => {
+    if (e.key === 'Enter') {
+      sendCommand(e.target.value);
+      e.target.value = '';
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHistoryIdx(i => {
+        const next = Math.min(i + 1, commandHistory.length - 1);
+        if (commandRef.current && commandHistory[next]) commandRef.current.value = commandHistory[next];
+        return next;
+      });
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setHistoryIdx(i => {
+        const next = Math.max(i - 1, -1);
+        if (commandRef.current) commandRef.current.value = next >= 0 ? commandHistory[next] : '';
+        return next;
+      });
+    }
+  }, [sendCommand, commandHistory]);
+
+  const handleChatKeyDown = useCallback((e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendChat(e.target.value);
+      e.target.value = '';
+    }
+  }, [sendChat]);
+
+  const handleZoom = useCallback((level) => {
+    fetch('/api/zoom', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ level }),
+    }).then(r => r.json()).then(data => {
+      setStatusMsg(data.result?.toUpperCase() || '');
+      refreshView();
+    });
+  }, [refreshView]);
+
+  const handleNodeClick = useCallback((node) => {
+    setSelectedNode(node);
+    setRightTab('inspect');
+  }, []);
+
+  const handleNodeDoubleClick = useCallback((node) => {
+    fetch('/api/focus', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ node_id: node.id, depth: 2 }),
+    }).then(r => r.json()).then(data => {
+      setStatusMsg(data.result?.toUpperCase() || '');
+      refreshView();
+    });
+  }, [refreshView]);
+
+  const handleSaveSettings = useCallback((apiKey, model) => {
+    fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ api_key: apiKey, model }),
+    }).then(r => r.json()).then(data => {
+      setHasApiKey(data.has_api_key);
+      setLlmModel(data.model);
+      setStatusMsg(data.has_api_key ? 'API KEY CONFIGURED' : 'API KEY CLEARED');
+    });
+  }, []);
+
+  const currentZoom = snapshot?.view?.zoom_level || 'function';
+  const activeEdgeTypes = snapshot?.view?.visible_edge_types || ['calls','imports','inherits','reads','writes','contains','returns'];
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [rightPanelOpen, setRightPanelOpen] = useState(true);
+
+  const handleEdgeToggle = useCallback((edgeType) => {
+    const current = new Set(activeEdgeTypes);
+    if (current.has(edgeType)) {
+      current.delete(edgeType);
+    } else {
+      current.add(edgeType);
+    }
+    const types = [...current];
+    fetch('/api/edge_types', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ edge_types: types }),
+    }).then(() => refreshView());
+  }, [activeEdgeTypes, refreshView]);
+
+  const gridCols = `${sidebarOpen ? '260px' : '0px'} 1fr ${rightPanelOpen ? '320px' : '0px'}`;
+
+  return (
+    <div className="app-container" style={{ gridTemplateColumns: gridCols }}>
+      <Header stats={stats} currentZoom={currentZoom} onZoom={handleZoom}
+        activeEdgeTypes={activeEdgeTypes} onEdgeToggle={handleEdgeToggle} />
+
+      {/* Sidebar collapse toggle */}
+      {!sidebarOpen && (
+        <button className="panel-collapse-btn" style={{ top: 70, left: 6 }}
+          onClick={() => setSidebarOpen(true)}>▶</button>
+      )}
+      {sidebarOpen && (
+        <button className="panel-collapse-btn" style={{ top: 70, left: 234 }}
+          onClick={() => setSidebarOpen(false)}>◀</button>
+      )}
+
+      {sidebarOpen && <Sidebar nodes={snapshot?.nodes || []} selectedNode={selectedNode} onNodeClick={handleNodeClick} />}
+      <GraphCanvas snapshot={snapshot} selectedNode={selectedNode} onNodeClick={handleNodeClick} onNodeDoubleClick={handleNodeDoubleClick} />
+
+      {/* Right panel collapse toggle */}
+      {!rightPanelOpen && (
+        <button className="panel-collapse-btn" style={{ top: 70, right: 6 }}
+          onClick={() => setRightPanelOpen(true)}>◀</button>
+      )}
+      {rightPanelOpen && (
+        <button className="panel-collapse-btn" style={{ top: 70, right: 296 }}
+          onClick={() => setRightPanelOpen(false)}>▶</button>
+      )}
+
+      {rightPanelOpen && <RightPanel
+        node={selectedNode} edges={snapshot?.edges || []} allNodes={snapshot?.nodes || []}
+        onNodeClick={handleNodeClick}
+        onCommand={sendCommand} onKeyDown={handleKeyDown} commandRef={commandRef}
+        rightTab={rightTab} setRightTab={setRightTab}
+        chatMessages={chatMessages} chatLoading={chatLoading}
+        onChatKeyDown={handleChatKeyDown} chatInputRef={chatInputRef} chatScrollRef={chatScrollRef}
+        hasApiKey={hasApiKey} llmModel={llmModel} onSaveSettings={handleSaveSettings}
+      />}
+      <StatusBar message={statusMsg} snapshot={snapshot} />
+    </div>
+  );
+}
+
+function Header({ stats, currentZoom, onZoom, activeEdgeTypes, onEdgeToggle }) {
+  const edgeSet = new Set(activeEdgeTypes || []);
+  const EDGE_CHIPS = [
+    { type: 'calls',    color: '#88bbdd' },
+    { type: 'imports',  color: '#667799' },
+    { type: 'inherits', color: '#bb77ee' },
+    { type: 'reads',    color: '#33ccaa' },
+    { type: 'writes',   color: '#ff5566' },
+    { type: 'returns',  color: '#eebb44' },
+    { type: 'contains', color: '#556677' },
+  ];
+  return (
+    <div className="header">
+      <div>
+        <div className="logo">INTERLINKED</div>
+        <div className="logo-sub">TOPOLOGY EXPLORER</div>
+      </div>
+      <span className="separator" />
+      <div className="stats">
+        {stats && <>
+          <span>MOD<span className="stat-value">{stats.modules}</span></span>
+          <span>CLS<span className="stat-value">{stats.classes}</span></span>
+          <span>FN<span className="stat-value">{stats.functions + stats.methods}</span></span>
+          <span>VAR<span className="stat-value">{stats.variables}</span></span>
+          <span>PRM<span className="stat-value">{stats.parameters}</span></span>
+          <span>EXT<span className="stat-value">{stats.external_calls}</span></span>
+          <span>DEAD<span className="stat-value stat-dead">{stats.dead_nodes}</span></span>
+          <span>EDGE<span className="stat-value">{stats.total_edges}</span></span>
+        </>}
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginLeft: 'auto' }}>
+        <div className="zoom-controls">
+          {['all', 'module', 'class', 'function', 'variable'].map(level => (
+            <button key={level} className={`zoom-btn ${currentZoom === level ? 'active' : ''}`}
+              onClick={() => onZoom(level)}>{level}</button>
+          ))}
+        </div>
+        <div style={{ display: 'flex', gap: 3, justifyContent: 'flex-end' }}>
+          {EDGE_CHIPS.map(({ type, color }) => (
+            <button key={type}
+              className={`edge-chip ${edgeSet.has(type) ? 'active' : ''}`}
+              style={edgeSet.has(type) ? { borderColor: color + '88', color: color } : {}}
+              onClick={() => onEdgeToggle(type)}>{type}</button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ nodes, selectedNode, onNodeClick }) {
+  const grouped = useMemo(() => {
+    const groups = {};
+    for (const n of nodes) { const t = n.symbol_type; if (!groups[t]) groups[t] = []; groups[t].push(n); }
+    return groups;
+  }, [nodes]);
+
+  return (
+    <div className="sidebar-left">
+      {['module', 'class', 'function', 'method', 'variable'].map(type => grouped[type]?.length > 0 && (
+        <div className="sidebar-section" key={type}>
+          <div className="sidebar-section-title">{type}s ({grouped[type].length})</div>
+          {grouped[type].slice(0, 100).map(node => (
+            <div key={node.id} className={`node-list-item ${selectedNode?.id === node.id ? 'active' : ''}`}
+              onClick={() => onNodeClick(node)} title={node.qualified_name}>
+              <span className={`node-badge ${node.symbol_type}`}>{node.symbol_type.slice(0, 3)}</span>
+              <span className="node-name">{node.name}</span>
+              {node.is_dead && <span className="dead-indicator" />}
+              {node.is_proposed && <span className="proposed-indicator" />}
+            </div>
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function GraphCanvas({ snapshot, selectedNode, onNodeClick, onNodeDoubleClick }) {
+  const svgRef = useRef(null);
+  const containerRef = useRef(null);
+
+  useEffect(() => {
+    if (!snapshot?.nodes?.length || !svgRef.current) return;
+
+    const svg = d3.select(svgRef.current);
+    const container = containerRef.current;
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+    const nodeCount = snapshot.nodes.length;
+    const isLarge = nodeCount > 200;
+    const isHuge = nodeCount > 800;
+
+    svg.selectAll('*').remove();
+
+    // Defs: arrowheads + glow filters
+    const defs = svg.append('defs');
+    Object.entries(EDGE_COLORS).forEach(([type, color]) => {
+      defs.append('marker')
+        .attr('id', `arrow-${type}`)
+        .attr('viewBox', '0 -5 10 10')
+        .attr('refX', 20).attr('refY', 0)
+        .attr('markerWidth', 5).attr('markerHeight', 5)
+        .attr('orient', 'auto')
+        .append('path')
+        .attr('d', 'M0,-3L10,0L0,3')
+        .attr('fill', color).attr('opacity', 0.7);
+    });
+    Object.entries(TRACE_EDGE_COLORS).forEach(([role, color]) => {
+      defs.append('marker')
+        .attr('id', `trace-arrow-${role}`)
+        .attr('viewBox', '0 -5 10 10')
+        .attr('refX', 22).attr('refY', 0)
+        .attr('markerWidth', 7).attr('markerHeight', 7)
+        .attr('orient', 'auto')
+        .append('path')
+        .attr('d', 'M0,-4L10,0L0,4')
+        .attr('fill', color).attr('opacity', 1);
+      defs.append('marker')
+        .attr('id', `trace-arrow-rev-${role}`)
+        .attr('viewBox', '0 -5 10 10')
+        .attr('refX', -12).attr('refY', 0)
+        .attr('markerWidth', 7).attr('markerHeight', 7)
+        .attr('orient', 'auto-start-reverse')
+        .append('path')
+        .attr('d', 'M0,-4L10,0L0,4')
+        .attr('fill', color).attr('opacity', 1);
+    });
+
+    // Glow filters — skip for huge graphs (major perf drain)
+    if (!isHuge) {
+      const glow = defs.append('filter').attr('id', 'glow');
+      glow.append('feGaussianBlur').attr('stdDeviation', '3').attr('result', 'coloredBlur');
+      const merge = glow.append('feMerge');
+      merge.append('feMergeNode').attr('in', 'coloredBlur');
+      merge.append('feMergeNode').attr('in', 'SourceGraphic');
+
+      const glowStrong = defs.append('filter').attr('id', 'glow-strong')
+        .attr('x', '-50%').attr('y', '-50%').attr('width', '200%').attr('height', '200%');
+      glowStrong.append('feGaussianBlur').attr('stdDeviation', '6').attr('result', 'blur1');
+      glowStrong.append('feGaussianBlur').attr('in', 'SourceGraphic').attr('stdDeviation', '2').attr('result', 'blur2');
+      const mergeStrong = glowStrong.append('feMerge');
+      mergeStrong.append('feMergeNode').attr('in', 'blur1');
+      mergeStrong.append('feMergeNode').attr('in', 'blur2');
+      mergeStrong.append('feMergeNode').attr('in', 'SourceGraphic');
+    }
+
+    const g = svg.append('g');
+
+    // Track current zoom transform for viewport culling + LOD
+    let currentTransform = d3.zoomIdentity;
+    const zoomBehavior = d3.zoom().scaleExtent([0.05, 8])
+      .on('zoom', (event) => {
+        currentTransform = event.transform;
+        g.attr('transform', event.transform);
+        if (isLarge) applyLOD();
+      });
+    svg.call(zoomBehavior);
+
+    const nodes = snapshot.nodes.map(n => ({
+      ...n,
+      x: snapshot.layout?.[n.id]?.x || width / 2 + (Math.random() - 0.5) * 400,
+      y: snapshot.layout?.[n.id]?.y || height / 2 + (Math.random() - 0.5) * 400,
+    }));
+
+    const nodeMap = {};
+    nodes.forEach(n => nodeMap[n.id] = n);
+    const highlightedSet = new Set(snapshot.view?.highlighted_node_ids || []);
+    const hasHighlights = highlightedSet.size > 0;
+    const isDimmed = (id) => hasHighlights && !highlightedSet.has(id);
+    const traceNodeRoles = snapshot.view?.trace_node_roles || {};
+    const traceEdgeRoles = snapshot.view?.trace_edge_roles || {};
+    const hasTraceRoles = Object.keys(traceNodeRoles).length > 0;
+
+    const nodeColor = (d) => {
+      const role = traceNodeRoles[d.id];
+      if (role && TRACE_ROLE_COLORS[role]) return TRACE_ROLE_COLORS[role];
+      return NODE_COLORS[d.symbol_type] || '#4a7a9a';
+    };
+
+    const edgeColor = (d) => {
+      if (d.is_proposed) return EDGE_COLORS.proposed;
+      const key = `${d.source?.id || d.source}|${d.target?.id || d.target}`;
+      const role = traceEdgeRoles[key];
+      if (role && TRACE_EDGE_COLORS[role]) return TRACE_EDGE_COLORS[role];
+      return EDGE_COLORS[d.edge_type] || '#1a3a5c';
+    };
+
+    const edges = snapshot.edges
+      .filter(e => nodeMap[e.source] && nodeMap[e.target] && e.edge_type !== 'contains')
+      .map(e => ({ ...e, source: nodeMap[e.source], target: nodeMap[e.target] }));
+
+    // ── SIMULATION — adaptive parameters based on graph size ──────
+    const sim = d3.forceSimulation(nodes)
+      .force('link', d3.forceLink(edges).id(d => d.id)
+        .distance(isHuge ? 80 : isLarge ? 100 : 140)
+        .strength(isHuge ? 0.1 : 0.25))
+      .force('charge', d3.forceManyBody()
+        .strength(isHuge ? -80 : isLarge ? -180 : -350)
+        .distanceMax(isHuge ? 300 : 600))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+      .force('collision', d3.forceCollide().radius(d =>
+        (NODE_SIZES[d.symbol_type] || 10) + (isHuge ? 4 : isLarge ? 10 : 18)));
+
+    // For large graphs: use server layout as starting positions, limit iterations
+    if (isLarge) {
+      sim.alpha(0.3).alphaDecay(isHuge ? 0.05 : 0.03);
+    }
+
+    const edgeIsHot = (d) => highlightedSet.has(d.source?.id) || highlightedSet.has(d.target?.id);
+    const edgeIsBright = (d) => highlightedSet.has(d.source?.id) && highlightedSet.has(d.target?.id);
+    const edgeShouldGlow = (d) => hasHighlights && (edgeIsBright(d) || (!hasTraceRoles && edgeIsHot(d)));
+
+    // ── EDGES ──────────────────────────────────────────────────────
+    const edgeGlowG = g.append('g').attr('class', 'edge-glow-layer');
+    const edgeMainG = g.append('g').attr('class', 'edge-main-layer');
+
+    // Glow layer (skip entirely for huge graphs)
+    const edgeGlow = isHuge ? edgeGlowG.selectAll('line') :
+      edgeGlowG.selectAll('line').data(edges).join('line')
+        .attr('stroke', d => edgeColor(d))
+        .attr('stroke-width', d => hasHighlights && edgeShouldGlow(d) ? 8 : 4)
+        .attr('opacity', d => hasHighlights ? (edgeShouldGlow(d) ? 0.35 : 0) : 0.06)
+        .attr('filter', d => hasHighlights && edgeShouldGlow(d) ? 'url(#glow)' : null);
+
+    const edgeSelection = edgeMainG.selectAll('line').data(edges).join('line')
+      .attr('stroke', d => {
+        if (!hasHighlights) return edgeColor(d);
+        if (edgeShouldGlow(d)) return edgeColor(d);
+        return '#0a0a12';
+      })
+      .attr('stroke-width', d => {
+        if (hasHighlights && edgeShouldGlow(d)) return 2.5;
+        return EDGE_WIDTH[d.edge_type] || 1;
+      })
+      .attr('stroke-dasharray', d => {
+        if (hasHighlights && edgeShouldGlow(d)) return null;
+        return EDGE_DASH[d.edge_type] || null;
+      })
+      .attr('marker-end', d => {
+        if (edgeShouldGlow(d)) {
+          const key = `${d.source?.id}|${d.target?.id}`;
+          const role = traceEdgeRoles[key];
+          if (role && TRACE_EDGE_COLORS[role]) return `url(#trace-arrow-${role})`;
+        }
+        return `url(#arrow-${d.is_proposed ? 'proposed' : d.edge_type})`;
+      })
+      .attr('marker-start', d => {
+        if (!edgeShouldGlow(d)) return null;
+        const revKey = `${d.target?.id}|${d.source?.id}`;
+        const revRole = traceEdgeRoles[revKey];
+        if (revRole && TRACE_EDGE_COLORS[revRole]) return `url(#trace-arrow-rev-${revRole})`;
+        return null;
+      })
+      .attr('opacity', d => hasHighlights ? (edgeShouldGlow(d) ? 1.0 : 0.03) : 0.6);
+
+    // ── NODES ──────────────────────────────────────────────────────
+    const nodeGroup = g.append('g').attr('class', 'node-layer').selectAll('g').data(nodes).join('g')
+      .attr('class', 'node-group')
+      .call(d3.drag()
+        .on('start', (event, d) => { if (!event.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
+        .on('drag', (event, d) => { d.fx = event.x; d.fy = event.y; })
+        .on('end', (event, d) => { if (!event.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+      )
+      .on('click', (event, d) => onNodeClick(d))
+      .on('dblclick', (event, d) => { event.stopPropagation(); onNodeDoubleClick(d); });
+
+    // Outer glow halo — skip for huge graphs
+    if (!isHuge) {
+      nodeGroup.filter(d => highlightedSet.has(d.id)).append('path')
+        .attr('class', 'node-halo')
+        .attr('d', d => {
+          const r = (NODE_SIZES[d.symbol_type] || 10) + 8;
+          return (NODE_SHAPES[d.symbol_type] || NODE_SHAPES.function)(r);
+        })
+        .attr('fill', 'none')
+        .attr('stroke', d => nodeColor(d))
+        .attr('stroke-width', 2)
+        .attr('opacity', 0.9)
+        .attr('filter', 'url(#glow-strong)');
+    }
+
+    // Main node shape
+    nodeGroup.append('path')
+      .attr('class', 'node-shape')
+      .attr('d', d => {
+        const r = NODE_SIZES[d.symbol_type] || 10;
+        return (NODE_SHAPES[d.symbol_type] || NODE_SHAPES.function)(r);
+      })
+      .attr('fill', d => {
+        if (isDimmed(d.id)) return '#0c0c14';
+        if (highlightedSet.has(d.id)) return nodeColor(d);
+        const c = NODE_COLORS[d.symbol_type] || '#55aacc';
+        return d.is_proposed ? c + '66' : c;
+      })
+      .attr('stroke', d => {
+        if (isDimmed(d.id)) return (NODE_COLORS[d.symbol_type] || '#55aacc') + '20';
+        if (highlightedSet.has(d.id)) return nodeColor(d);
+        return NODE_COLORS[d.symbol_type] || '#55aacc';
+      })
+      .attr('stroke-width', d => isDimmed(d.id) ? 0.5 : (highlightedSet.has(d.id) ? 1.5 : 1))
+      .attr('filter', d => {
+        if (isHuge) return null;
+        return highlightedSet.has(d.id) ? 'url(#glow-strong)' : isDimmed(d.id) ? null : 'url(#glow)';
+      });
+
+    // Labels
+    nodeGroup.append('text')
+      .attr('class', 'node-label')
+      .attr('dy', d => (NODE_SIZES[d.symbol_type] || 10) + 15)
+      .attr('opacity', d => isDimmed(d.id) ? 0.06 : 1)
+      .attr('fill', d => highlightedSet.has(d.id) ? (hasTraceRoles ? nodeColor(d) : '#ffffff') : null)
+      .attr('filter', d => (!isHuge && highlightedSet.has(d.id)) ? 'url(#glow)' : null)
+      .text(d => d.name);
+
+    // ── LOD: viewport culling + detail levels on zoom ─────────────
+    function applyLOD() {
+      const k = currentTransform.k;
+      // LOD thresholds
+      const showLabels = k > 0.4;
+      const showDimmedEdges = k > 0.25 || !hasHighlights;
+      const showEdgeGlow = k > 0.3 && !isHuge;
+
+      // Viewport bounds in graph coordinates (with padding)
+      const pad = 200 / k;
+      const vx0 = (-currentTransform.x / k) - pad;
+      const vy0 = (-currentTransform.y / k) - pad;
+      const vx1 = (width - currentTransform.x) / k + pad;
+      const vy1 = (height - currentTransform.y) / k + pad;
+
+      const inView = (x, y) => x >= vx0 && x <= vx1 && y >= vy0 && y <= vy1;
+
+      // Cull nodes
+      nodeGroup.each(function(d) {
+        const visible = inView(d.x, d.y);
+        d3.select(this).attr('display', visible ? null : 'none');
+        if (visible) {
+          d3.select(this).select('.node-label').attr('display', showLabels ? null : 'none');
+        }
+      });
+
+      // Cull edges
+      edgeSelection.attr('display', d => {
+        if (!showDimmedEdges && !edgeShouldGlow(d)) return 'none';
+        const sx = d.source.x, sy = d.source.y, tx = d.target.x, ty = d.target.y;
+        return (inView(sx, sy) || inView(tx, ty)) ? null : 'none';
+      });
+
+      if (!isHuge) {
+        edgeGlow.attr('display', d => {
+          if (!showEdgeGlow) return 'none';
+          const sx = d.source.x, sy = d.source.y, tx = d.target.x, ty = d.target.y;
+          return (inView(sx, sy) || inView(tx, ty)) ? null : 'none';
+        });
+      }
+    }
+
+    // ── TICK ───────────────────────────────────────────────────────
+    let tickCount = 0;
+    const lodInterval = isHuge ? 3 : isLarge ? 2 : 1;
+
+    sim.on('tick', () => {
+      tickCount++;
+      if (!isHuge) {
+        edgeGlow.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+          .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+      }
+      edgeSelection.attr('x1', d => d.source.x).attr('y1', d => d.source.y)
+        .attr('x2', d => d.target.x).attr('y2', d => d.target.y);
+      nodeGroup.attr('transform', d => `translate(${d.x},${d.y})`);
+
+      // Apply LOD periodically during simulation
+      if (isLarge && tickCount % lodInterval === 0) applyLOD();
+    });
+
+    // Final LOD pass after simulation settles
+    sim.on('end', () => { if (isLarge) applyLOD(); });
+
+    return () => sim.stop();
+  }, [snapshot, onNodeClick, onNodeDoubleClick]);
+
+  const ctx = snapshot?.view?.context;
+  const hasContext = ctx && (ctx.what || ctx.why || ctx.where);
+  const [contextDismissed, setContextDismissed] = useState(null);
+
+  // Reset dismissed state when context changes
+  useEffect(() => { setContextDismissed(null); }, [ctx?.what]);
+
+  return (
+    <div className="graph-container" ref={containerRef}>
+      {hasContext && contextDismissed !== ctx.what && (
+        <div className="context-banner">
+          <button className="cb-dismiss" onClick={() => setContextDismissed(ctx.what)}>&times;</button>
+          {ctx.what && <div className="cb-row"><span className="cb-label">WHAT</span><span className="cb-text">{ctx.what}</span></div>}
+          {ctx.why && <div className="cb-row"><span className="cb-label">WHY</span><span className="cb-text">{ctx.why}</span></div>}
+          {ctx.where && <div className="cb-row"><span className="cb-label">WHERE</span><span className="cb-text">{ctx.where}</span></div>}
+          {ctx.source && <div className="cb-source">VIA {ctx.source.toUpperCase()}</div>}
+        </div>
+      )}
+      <Legend snapshot={snapshot} />
+      <svg ref={svgRef} />
+      <div className="interlinked-watermark">INTERLINKED</div>
+    </div>
+  );
+}
+
+function Legend({ snapshot }) {
+  const [collapsed, setCollapsed] = useState(false);
+  const hasTrace = snapshot?.view?.trace_node_roles && Object.keys(snapshot.view.trace_node_roles).length > 0;
+
+  if (collapsed) {
+    return (
+      <div className="legend-bar collapsed" onClick={() => setCollapsed(false)}>
+        <span style={{ fontFamily: "'Orbitron', sans-serif", fontSize: 9, letterSpacing: 2, color: 'var(--text-muted)' }}>
+          ▲ LEGEND
+        </span>
+      </div>
+    );
+  }
+
+  const shapeIcon = (type, color, sz = 14) => {
+    const r = sz / 2;
+    const d = (NODE_SHAPES[type] || NODE_SHAPES.function)(r);
+    return (<svg width={sz+2} height={sz+2} style={{flexShrink:0,verticalAlign:'middle'}}>
+      <g transform={`translate(${r+1},${r+1})`}>
+        <path d={d} fill={color} stroke={color} strokeWidth="0.5" style={{filter:`drop-shadow(0 0 3px ${color})`}} />
+      </g>
+    </svg>);
+  };
+
+  const lineIcon = (color, dash, w = 1.5) => (
+    <svg width={30} height={6} style={{flexShrink:0,verticalAlign:'middle'}}>
+      <line x1="0" y1="3" x2="30" y2="3" stroke={color} strokeWidth={Math.max(w,1.5)}
+        strokeDasharray={dash||undefined} style={{filter:`drop-shadow(0 0 2px ${color})`}} />
+    </svg>
+  );
+
+  const dot = (color) => (
+    <svg width={10} height={10} style={{flexShrink:0,verticalAlign:'middle'}}>
+      <circle cx="5" cy="5" r="4" fill={color} style={{filter:`drop-shadow(0 0 4px ${color})`}} />
+    </svg>
+  );
+
+  return (
+    <div className="legend-bar">
+      <button className="legend-collapse-btn" onClick={() => setCollapsed(true)}>▼</button>
+
+      <div className="legend-group">
+        <div className="legend-group-title">SYMBOLS</div>
+        {Object.entries(NODE_COLORS).map(([t, c]) => (
+          <div className="legend-row" key={t}>{shapeIcon(t, c)} <span style={{color:c}}>{t}</span></div>
+        ))}
+      </div>
+
+      <div className="legend-group">
+        <div className="legend-group-title">RELATIONSHIPS</div>
+        {Object.entries(EDGE_COLORS).filter(([t]) => t !== 'contains' && t !== 'proposed').map(([t, c]) => (
+          <div className="legend-row" key={t}>{lineIcon(c, EDGE_DASH[t], EDGE_WIDTH[t])} <span style={{color:c}}>{t}</span></div>
+        ))}
+      </div>
+
+      {hasTrace && <>
+        <div className="legend-group">
+          <div className="legend-group-title">TRACE ROLES</div>
+          {Object.entries(TRACE_ROLE_COLORS).map(([r, c]) => (
+            <div className="legend-row" key={`tr-${r}`}>{dot(c)} <span style={{color:c}}>{r}</span></div>
+          ))}
+        </div>
+
+        <div className="legend-group">
+          <div className="legend-group-title">TRACE EDGES</div>
+          {Object.entries(TRACE_EDGE_COLORS).map(([r, c]) => (
+            <div className="legend-row" key={`te-${r}`}>{lineIcon(c, null, 2.5)} <span style={{color:c}}>{r}</span></div>
+          ))}
+        </div>
+      </>}
+    </div>
+  );
+}
+
+function RightPanel({
+  node, edges, allNodes, onNodeClick,
+  onCommand, onKeyDown, commandRef,
+  rightTab, setRightTab,
+  chatMessages, chatLoading, onChatKeyDown, chatInputRef, chatScrollRef,
+  hasApiKey, llmModel, onSaveSettings,
+}) {
+  const nodeEdges = useMemo(() => {
+    if (!node) return { incoming: [], outgoing: [] };
+    return {
+      incoming: edges.filter(e => e.target === node.id && e.edge_type !== 'contains'),
+      outgoing: edges.filter(e => e.source === node.id && e.edge_type !== 'contains'),
+    };
+  }, [node, edges]);
+
+  const nodeMap = useMemo(() => {
+    const m = {}; allNodes.forEach(n => m[n.id] = n); return m;
+  }, [allNodes]);
+
+  const quoteIdx = useMemo(() => Math.floor(Math.random() * GOSLING_QUOTES.length), []);
+
+  return (
+    <div className="sidebar-right">
+      {/* Tab bar */}
+      <div style={{ display: 'flex', borderBottom: '1px solid var(--border-grid)', flexShrink: 0 }}>
+        {[['inspect', 'INSPECT'], ['chat', 'CHAT'], ['settings', 'CFG']].map(([key, label]) => (
+          <button key={key} onClick={() => setRightTab(key)} style={{
+            flex: 1, padding: '10px 0', border: 'none', cursor: 'pointer',
+            fontFamily: "'Orbitron', sans-serif", fontSize: 9, fontWeight: 700, letterSpacing: 2,
+            background: rightTab === key ? '#00d4ff11' : 'transparent',
+            color: rightTab === key ? 'var(--neon-cyan)' : 'var(--text-muted)',
+            borderBottom: rightTab === key ? '2px solid var(--neon-cyan)' : '2px solid transparent',
+            textShadow: rightTab === key ? '0 0 6px #00d4ff44' : 'none',
+            transition: 'all 0.15s',
+          }}>{label}</button>
+        ))}
+      </div>
+
+      {/* Tab content */}
+      <div className="detail-panel">
+        {rightTab === 'inspect' && (
+          node ? (
+            <>
+              <div className="detail-title">{node.name}</div>
+              <DetailField label="Type" value={node.symbol_type.toUpperCase()} />
+              <DetailField label="Qualified Name" value={<code>{node.qualified_name}</code>} />
+              {node.file_path && <DetailField label="File" value={node.file_path.split('/').slice(-3).join('/')} />}
+              {node.line_start && <DetailField label="Lines" value={`${node.line_start} - ${node.line_end || '?'}`} />}
+              {node.signature && <DetailField label="Signature" value={<code>{node.signature}</code>} />}
+              {node.docstring && <DetailField label="Docstring" value={node.docstring} />}
+              {node.is_dead && <DetailField label="Status" value={<span style={{color: 'var(--neon-magenta)', textShadow: '0 0 6px #ff297566'}}>DEAD // UNREACHABLE</span>} />}
+              {node.is_proposed && <DetailField label="Status" value={<span style={{color: 'var(--neon-green)', textShadow: '0 0 6px #39ff1466'}}>PROPOSED // HYPOTHETICAL</span>} />}
+              {nodeEdges.incoming.length > 0 && (
+                <div className="detail-field">
+                  <div className="detail-label">Incoming ({nodeEdges.incoming.length})</div>
+                  <ul className="connections-list">
+                    {nodeEdges.incoming.slice(0, 20).map((e, i) => (
+                      <li key={i} onClick={() => nodeMap[e.source] && onNodeClick(nodeMap[e.source])}>
+                        <span className="edge-type-badge" style={{ borderColor: (EDGE_COLORS[e.edge_type] || '#666') + '55', color: EDGE_COLORS[e.edge_type] || '#666', background: (EDGE_COLORS[e.edge_type] || '#666') + '11' }}>
+                          {e.edge_type}
+                        </span>
+                        {e.source}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {nodeEdges.outgoing.length > 0 && (
+                <div className="detail-field">
+                  <div className="detail-label">Outgoing ({nodeEdges.outgoing.length})</div>
+                  <ul className="connections-list">
+                    {nodeEdges.outgoing.slice(0, 20).map((e, i) => {
+                      const isExternal = !nodeMap[e.target];
+                      return (
+                      <li key={i} onClick={() => nodeMap[e.target] && onNodeClick(nodeMap[e.target])}
+                        style={isExternal ? { opacity: 0.6, fontStyle: 'italic', cursor: 'default' } : {}}>
+                        <span className="edge-type-badge" style={{ borderColor: (EDGE_COLORS[e.edge_type] || '#666') + '55', color: isExternal ? '#997744' : (EDGE_COLORS[e.edge_type] || '#666'), background: (EDGE_COLORS[e.edge_type] || '#666') + '11' }}>
+                          {isExternal ? 'ext' : e.edge_type}
+                        </span>
+                        {e.target}{isExternal ? ' ↗' : ''}
+                      </li>
+                      );
+                    })}
+                  </ul>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="empty-state">
+              <div className="gosling-quote" style={{whiteSpace: 'pre-line'}}>{GOSLING_QUOTES[quoteIdx][0]}</div>
+              <div className="gosling-sub">{GOSLING_QUOTES[quoteIdx][1]}</div>
+              <div style={{ marginTop: 30, fontSize: 9, color: 'var(--text-muted)', letterSpacing: 2 }}>
+                CLICK A NODE TO INSPECT<br/>DOUBLE-CLICK TO FOCUS
+              </div>
+            </div>
+          )
+        )}
+
+        {rightTab === 'chat' && (
+          <ChatPanel
+            messages={chatMessages} loading={chatLoading}
+            onKeyDown={onChatKeyDown} inputRef={chatInputRef} scrollRef={chatScrollRef}
+            hasApiKey={hasApiKey}
+          />
+        )}
+
+        {rightTab === 'settings' && (
+          <SettingsPanel hasApiKey={hasApiKey} llmModel={llmModel} onSave={onSaveSettings} />
+        )}
+      </div>
+
+      {/* Command bar — always visible */}
+      <div className="command-bar">
+        <div className="command-input-wrapper">
+          <span className="command-prefix">&gt;_</span>
+          <input ref={commandRef} className="command-input"
+            placeholder="view.isolate('analyzer') or Python..." onKeyDown={onKeyDown} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ChatPanel({ messages, loading, onKeyDown, inputRef, scrollRef, hasApiKey }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <div ref={scrollRef} style={{ flex: 1, overflowY: 'auto', padding: '0 0 10px 0' }}>
+        {messages.length === 0 && (
+          <div style={{ textAlign: 'center', marginTop: 40, color: 'var(--text-muted)' }}>
+            <div style={{ fontFamily: "'Orbitron', sans-serif", fontSize: 11, letterSpacing: 3, color: 'var(--neon-cyan)', textShadow: 'var(--glow-cyan)', marginBottom: 12 }}>
+              PILOT INTERFACE
+            </div>
+            <div style={{ fontSize: 10, lineHeight: 1.8, letterSpacing: 1, maxWidth: 240, margin: '0 auto' }}>
+              {hasApiKey
+                ? 'Talk naturally. The LLM will drive the visualization for you.\n\nTry: "Show me the analyzer module and everything that connects to it"'
+                : 'Configure your Anthropic API key in Settings to enable the chat pilot.\n\nOr use the command bar below with Python:\nview.isolate("analyzer")'}
+            </div>
+          </div>
+        )}
+        {messages.map((msg, i) => (
+          <div key={i} style={{
+            padding: '8px 10px',
+            marginBottom: 4,
+            borderLeft: msg.role === 'user' ? '2px solid var(--neon-orange)' :
+                        msg.role === 'assistant' ? '2px solid var(--neon-cyan)' : '2px solid var(--neon-magenta)',
+            background: msg.role === 'user' ? '#ff6a0006' :
+                        msg.role === 'assistant' ? '#00d4ff06' : '#ff297506',
+          }}>
+            <div style={{
+              fontFamily: "'Orbitron', sans-serif", fontSize: 8, fontWeight: 700, letterSpacing: 2,
+              marginBottom: 4, textTransform: 'uppercase',
+              color: msg.role === 'user' ? 'var(--neon-orange)' :
+                     msg.role === 'assistant' ? 'var(--neon-cyan)' : 'var(--neon-magenta)',
+            }}>
+              {msg.role === 'user' ? 'YOU' : msg.role === 'assistant' ? 'PILOT' : 'SYSTEM'}
+            </div>
+            <div style={{ fontSize: 11, lineHeight: 1.6, color: 'var(--text-primary)', whiteSpace: 'pre-wrap' }}>
+              {msg.content}
+            </div>
+            {msg.commands?.length > 0 && (
+              <div style={{ marginTop: 6, padding: '4px 6px', background: '#00d4ff08', border: '1px solid #00d4ff15', borderRadius: 2 }}>
+                <div style={{ fontFamily: "'Orbitron', sans-serif", fontSize: 7, color: 'var(--text-muted)', letterSpacing: 2, marginBottom: 3 }}>EXECUTED</div>
+                {msg.commands.map((cmd, j) => (
+                  <div key={j} style={{ fontSize: 9, fontFamily: "'Share Tech Mono', monospace", color: 'var(--neon-dim)', padding: '1px 0' }}>
+                    {cmd}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        ))}
+        {loading && (
+          <div style={{ padding: '8px 10px', color: 'var(--neon-cyan)', fontSize: 11, fontFamily: "'Orbitron', sans-serif", letterSpacing: 2, animation: 'pulse-glow 1s infinite' }}>
+            PROCESSING...
+          </div>
+        )}
+      </div>
+      <div style={{ flexShrink: 0, borderTop: '1px solid var(--border-grid)', padding: '8px 0 0 0' }}>
+        <div className="command-input-wrapper">
+          <span className="command-prefix" style={{ color: 'var(--neon-cyan)' }}>AI</span>
+          <input ref={inputRef} className="command-input"
+            placeholder={hasApiKey ? "Ask the pilot anything..." : "Set API key in Settings first"}
+            onKeyDown={onKeyDown} disabled={!hasApiKey} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SettingsPanel({ hasApiKey, llmModel, onSave }) {
+  const [key, setKey] = useState('');
+  const [model, setModel] = useState(llmModel);
+
+  return (
+    <div style={{ padding: '10px 0' }}>
+      <div style={{ fontFamily: "'Orbitron', sans-serif", fontSize: 11, letterSpacing: 3, color: 'var(--neon-cyan)', textShadow: 'var(--glow-cyan)', marginBottom: 16 }}>
+        CONFIGURATION
+      </div>
+
+      <div className="detail-field">
+        <div className="detail-label">ANTHROPIC API KEY</div>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginTop: 4 }}>
+          <div style={{
+            width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
+            background: hasApiKey ? 'var(--neon-green)' : 'var(--neon-magenta)',
+            boxShadow: hasApiKey ? '0 0 6px var(--neon-green)' : '0 0 6px var(--neon-magenta)',
+          }} />
+          <span style={{ fontSize: 10, color: hasApiKey ? 'var(--neon-green)' : 'var(--neon-magenta)' }}>
+            {hasApiKey ? 'CONFIGURED' : 'NOT SET'}
+          </span>
+        </div>
+        <input
+          type="password"
+          placeholder="sk-ant-..."
+          value={key}
+          onChange={e => setKey(e.target.value)}
+          style={{
+            width: '100%', marginTop: 8, padding: '8px 10px',
+            background: 'var(--bg-void)', border: '1px solid var(--border-grid)', borderRadius: 2,
+            color: 'var(--text-primary)', fontFamily: "'Share Tech Mono', monospace", fontSize: 11,
+            outline: 'none',
+          }}
+        />
+      </div>
+
+      <div className="detail-field" style={{ marginTop: 12 }}>
+        <div className="detail-label">MODEL</div>
+        <select value={model} onChange={e => setModel(e.target.value)} style={{
+          width: '100%', marginTop: 4, padding: '8px 10px',
+          background: 'var(--bg-void)', border: '1px solid var(--border-grid)', borderRadius: 2,
+          color: 'var(--text-primary)', fontFamily: "'Share Tech Mono', monospace", fontSize: 11,
+          outline: 'none',
+        }}>
+          <option value="claude-sonnet-4-20250514">claude-sonnet-4-20250514</option>
+          <option value="claude-opus-4-20250514">claude-opus-4-20250514</option>
+          <option value="claude-3-5-haiku-20241022">claude-3-5-haiku-20241022</option>
+        </select>
+      </div>
+
+      <button onClick={() => onSave(key, model)} style={{
+        marginTop: 16, padding: '10px 20px', width: '100%',
+        background: 'transparent', border: '1px solid var(--neon-cyan)', borderRadius: 2,
+        color: 'var(--neon-cyan)', fontFamily: "'Orbitron', sans-serif", fontSize: 10,
+        fontWeight: 700, letterSpacing: 3, cursor: 'pointer',
+        textShadow: '0 0 6px #00d4ff44',
+        transition: 'all 0.2s',
+      }}
+        onMouseOver={e => { e.target.style.background = '#00d4ff11'; e.target.style.boxShadow = '0 0 15px #00d4ff22'; }}
+        onMouseOut={e => { e.target.style.background = 'transparent'; e.target.style.boxShadow = 'none'; }}
+      >SAVE</button>
+
+      <div style={{ marginTop: 24, padding: '10px', background: '#00d4ff06', border: '1px solid #00d4ff15', borderRadius: 2 }}>
+        <div className="detail-label">EXTERNAL AGENTS</div>
+        <div style={{ fontSize: 10, color: 'var(--text-secondary)', lineHeight: 1.7, marginTop: 4 }}>
+          Any LLM can drive this view via the REST API. Have your agent GET <code>/api/system-prompt</code> to learn the full command API, then POST to <code>/api/command</code> with Python commands.
+        </div>
+      </div>
+
+      <div style={{ marginTop: 12, padding: '10px', background: '#ff6a0006', border: '1px solid #ff6a0015', borderRadius: 2 }}>
+        <div className="detail-label">ENVIRONMENT VARIABLE</div>
+        <div style={{ fontSize: 10, color: 'var(--text-secondary)', lineHeight: 1.7, marginTop: 4 }}>
+          You can also set <code>ANTHROPIC_API_KEY</code> as an environment variable before starting the server.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DetailField({ label, value }) {
+  return (<div className="detail-field"><div className="detail-label">{label}</div><div className="detail-value">{value}</div></div>);
+}
+
+function StatusBar({ message, snapshot }) {
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [stationIdx, setStationIdx] = useState(0);
+  const [volume, setVolume] = useState(0.4);
+  const [nowPlaying, setNowPlaying] = useState('');
+  const audioRef = useRef(null);
+  const npIntervalRef = useRef(null);
+
+  const station = RADIO_STATIONS[stationIdx];
+
+  // Fetch now-playing metadata
+  const fetchNowPlaying = useCallback(() => {
+    const st = RADIO_STATIONS[stationIdx];
+    if (!st.nowPlayingUrl) {
+      setNowPlaying(st.name + '  ///  STREAMING LIVE');
+      return;
+    }
+    fetch(st.nowPlayingUrl).then(r => r.json()).then(data => {
+      let text = '';
+      if (st.parser === 'somafm') {
+        const song = data.songs?.[0];
+        if (song) text = `${song.artist}  —  ${song.title}`;
+      } else if (st.parser === 'plaza') {
+        const song = data.song;
+        if (song) text = `${song.artist}  —  ${song.title}`;
+      }
+      setNowPlaying(text || st.name);
+    }).catch(() => setNowPlaying(st.name));
+  }, [stationIdx]);
+
+  // Poll now-playing every 15s when playing
+  useEffect(() => {
+    if (isPlaying) {
+      fetchNowPlaying();
+      npIntervalRef.current = setInterval(fetchNowPlaying, 15000);
+    }
+    return () => { if (npIntervalRef.current) clearInterval(npIntervalRef.current); };
+  }, [isPlaying, fetchNowPlaying]);
+
+  const togglePlay = useCallback(() => {
+    if (!audioRef.current) {
+      audioRef.current = new Audio(station.url);
+      audioRef.current.volume = volume;
+      audioRef.current.crossOrigin = 'anonymous';
+    }
+    if (isPlaying) {
+      audioRef.current.pause();
+      audioRef.current.src = '';
+      audioRef.current = null;
+      setIsPlaying(false);
+      setNowPlaying('');
+    } else {
+      audioRef.current.src = station.url;
+      audioRef.current.play().catch(() => {});
+      setIsPlaying(true);
+    }
+  }, [isPlaying, station, volume]);
+
+  const changeStation = useCallback((idx) => {
+    const wasPlaying = isPlaying;
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = '';
+      audioRef.current = null;
+      setIsPlaying(false);
+    }
+    setStationIdx(idx);
+    setNowPlaying('');
+    if (wasPlaying) {
+      setTimeout(() => {
+        const st = RADIO_STATIONS[idx];
+        audioRef.current = new Audio(st.url);
+        audioRef.current.volume = volume;
+        audioRef.current.crossOrigin = 'anonymous';
+        audioRef.current.play().catch(() => {});
+        setIsPlaying(true);
+      }, 100);
+    }
+  }, [isPlaying, volume]);
+
+  const changeVolume = useCallback((val) => {
+    setVolume(val);
+    if (audioRef.current) audioRef.current.volume = val;
+  }, []);
+
+  return (
+    <div className="status-bar">
+      <span className="status-dot" />
+      <span className="status-msg">{message}</span>
+
+      {snapshot?.view?.focus_node && <span style={{color: 'var(--neon-orange)', flexShrink: 0}}>FOCUS: {snapshot.view.focus_node.split('.').slice(-2).join('.')}</span>}
+      <span style={{flexShrink: 0}}>ZOOM: {(snapshot?.view?.zoom_level || 'function').toUpperCase()}</span>
+
+      {/* Separator */}
+      <span style={{ width: 1, height: 20, background: 'var(--border-grid)', flexShrink: 0 }} />
+
+      {/* Radio Player */}
+      <div className="radio-container">
+        <select className="radio-station-select" value={stationIdx}
+          onChange={e => changeStation(Number(e.target.value))}>
+          {RADIO_STATIONS.map((st, i) => (
+            <option key={st.id} value={i}>{st.name}</option>
+          ))}
+        </select>
+
+        <button className={`radio-play-btn ${isPlaying ? 'playing' : ''}`} onClick={togglePlay}
+          title={isPlaying ? 'Pause' : 'Play'}>
+          {isPlaying ? (
+            <svg width="10" height="12" viewBox="0 0 10 12" fill="currentColor">
+              <rect x="0" y="0" width="3" height="12" rx="0.5"/>
+              <rect x="7" y="0" width="3" height="12" rx="0.5"/>
+            </svg>
+          ) : (
+            <svg width="10" height="12" viewBox="0 0 10 12" fill="currentColor">
+              <polygon points="0,0 10,6 0,12"/>
+            </svg>
+          )}
+        </button>
+
+        <input type="range" className="radio-volume" min="0" max="1" step="0.05"
+          value={volume} onChange={e => changeVolume(Number(e.target.value))} title={`Volume: ${Math.round(volume * 100)}%`} />
+
+        {/* Now Playing marquee */}
+        {nowPlaying && (
+          <div className="radio-nowplaying">
+            <span className="radio-nowplaying-text">{nowPlaying}</span>
+          </div>
+        )}
+      </div>
+
+      <span style={{color: 'var(--text-muted)', flexShrink: 0, marginLeft: 'auto'}}>WITHIN CELLS INTERLINKED</span>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
