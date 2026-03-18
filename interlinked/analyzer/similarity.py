@@ -257,8 +257,13 @@ def get_rich_context(graph: CodeGraph, node: NodeData) -> dict:
     context["callers"] = [{"id": n.id, "name": n.name} for n in callers[:20]]
     context["callees"] = [{"id": n.id, "name": n.name} for n in callees[:20]]
 
-    # Fingerprint
-    context["fingerprint"] = node.metadata.get("fingerprint")
+    # Fingerprint — slim version (drop ast_tree, minhash, ast_node_counts)
+    fp = node.metadata.get("fingerprint")
+    if fp and isinstance(fp, dict):
+        _heavy = {"ast_tree", "minhash", "ast_node_counts", "source_snippet"}
+        context["fingerprint"] = {k: v for k, v in fp.items() if k not in _heavy}
+    else:
+        context["fingerprint"] = fp
 
     return context
 

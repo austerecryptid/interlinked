@@ -12,6 +12,30 @@ from interlinked.models import (
 )
 
 
+# Fields in node.metadata["fingerprint"] that are huge and useless in
+# serialized query/snapshot output.  Kept in memory for similarity scoring.
+_FINGERPRINT_HEAVY_KEYS = frozenset({
+    "ast_tree", "minhash", "ast_node_counts",
+    "source_snippet",
+})
+
+
+def _slim_node_dict(d: dict) -> dict:
+    """Strip heavy fingerprint fields from a serialized NodeData dict."""
+    meta = d.get("metadata")
+    if not meta or "fingerprint" not in meta:
+        return d
+    fp = meta["fingerprint"]
+    if not isinstance(fp, dict):
+        return d
+    d = d.copy()
+    d["metadata"] = meta.copy()
+    d["metadata"]["fingerprint"] = {
+        k: v for k, v in fp.items() if k not in _FINGERPRINT_HEAVY_KEYS
+    }
+    return d
+
+
 class QueryEngine:
     """Provides a high-level API for querying and manipulating the code graph.
 
@@ -407,7 +431,7 @@ class QueryEngine:
 
         self._notify()
 
-        return [r.model_dump() for r in results]
+        return [_slim_node_dict(r.model_dump()) for r in results]
 
     def trace_variable(self, var_name: str, origin: str | None = None) -> str:
         """Trace a variable's path through reads/writes and highlight it.
@@ -1205,7 +1229,9 @@ class QueryEngine:
 
     def snapshot(self) -> dict:
         """Get the current graph snapshot as a dict (for JSON serialization)."""
-        return self.graph.snapshot(self.state).model_dump()
+        snap = self.graph.snapshot(self.state).model_dump()
+        snap["nodes"] = [_slim_node_dict(n) for n in snap.get("nodes", [])]
+        return snap
 
     # ── Stats ────────────────────────────────────────────────────────
 
