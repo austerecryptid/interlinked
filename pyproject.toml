@@ -21,7 +21,7 @@ classifiers = [
     "Framework :: FastAPI",
     "License :: OSI Approved :: MIT License",
 ]
-keywords = ["ast", "code-analysis", "topology", "graph", "visualization", "mcp", "networkx"]
+keywords = ["ast", "code-analysis", "topology", "graph", "visualization", "mcp", "networkx", "tree-sitter"]
 dependencies = [
     "networkx>=3.1",
     "fastapi>=0.110",
@@ -34,6 +34,11 @@ dependencies = [
 
 [project.optional-dependencies]
 similarity = ["torch>=2.0", "transformers>=4.30"]
+treesitter = ["tree-sitter>=0.23"]
+ts-python = ["tree-sitter>=0.23", "tree-sitter-python>=0.23"]
+ts-javascript = ["tree-sitter>=0.23", "tree-sitter-javascript>=0.23"]
+ts-typescript = ["tree-sitter>=0.23", "tree-sitter-typescript>=0.23"]
+multilang = ["tree-sitter>=0.23", "tree-sitter-python>=0.23", "tree-sitter-javascript>=0.23", "tree-sitter-typescript>=0.23"]
 
 [project.urls]
 Homepage = "https://github.com/austerecryptid/interlinked"

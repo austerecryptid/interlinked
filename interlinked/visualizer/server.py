@@ -24,6 +24,9 @@ FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"
 def _rebuild_graph(project_path: str, graph: CodeGraph, run_similarity: bool = True) -> dict:
     """Re-parse a project and rebuild the graph in-place. Returns stats.
 
+    Parses Python files with the ast-based parser (deep type inference),
+    then detects other languages via tree-sitter adapters and merges them.
+
     Similarity analysis is optional and CPU-heavy (~3s for large projects).
     When called from switch_project, it's skipped to avoid blocking — the
     startup event rebuilds embeddings/similarity in the background instead.
@@ -35,7 +38,23 @@ def _rebuild_graph(project_path: str, graph: CodeGraph, run_similarity: bool = T
     if not path.exists():
         raise ValueError(f"Path does not exist: {path}")
 
+    # Python: deep ast-based parsing with type inference
     nodes, edges = parse_project(str(path))
+
+    # Other languages: tree-sitter structural parsing
+    try:
+        from interlinked.analyzer.treesitter.registry import detect_languages
+        from interlinked.analyzer.treesitter.walker import parse_project_treesitter
+
+        for adapter in detect_languages(str(path)):
+            if adapter.name == "python":
+                continue  # already handled by ast parser
+            ts_nodes, ts_edges = parse_project_treesitter(str(path), adapter)
+            nodes.extend(ts_nodes)
+            edges.extend(ts_edges)
+    except ImportError:
+        pass  # tree-sitter not installed — Python-only mode
+
     graph.build_from(nodes, edges)
     dead = detect_dead_code(graph)
 
