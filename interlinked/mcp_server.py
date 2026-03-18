@@ -41,46 +41,46 @@ from interlinked.analyzer.dead_code import detect_dead_code
 from interlinked.commander.query import QueryEngine
 
 
+def _start_background_analysis(graph: CodeGraph, engine: QueryEngine, project_path: str) -> None:
+    """Run similarity + embeddings in background threads (non-blocking).
+
+    Mirrors the pattern used by the REST API server: parse returns fast,
+    then similarity fingerprinting and embedding builds run in the background.
+    """
+    import threading
+
+    # Similarity in background thread
+    def _run_similarity():
+        try:
+            from interlinked.analyzer.similarity import analyze_similarity
+            analyze_similarity(graph)
+        except Exception:
+            pass
+    threading.Thread(target=_run_similarity, daemon=True, name="mcp-similarity").start()
+
+    # Embeddings in background thread (via build_async which spawns its own thread)
+    try:
+        from interlinked.visualizer.server import _start_embedding_build, _collect_function_sources
+        _start_embedding_build(graph, project_path, engine)
+    except Exception:
+        pass
+
+
 def build_graph(project_path: str) -> tuple[CodeGraph, QueryEngine]:
-    """Parse a project and build the graph + query engine."""
+    """Parse a project and build the graph + query engine.
+
+    Returns immediately after parsing + dead code detection.
+    Similarity and embeddings run in background threads.
+    """
     nodes, edges = parse_project(project_path)
     graph = CodeGraph()
     graph.build_from(nodes, edges)
     detect_dead_code(graph)
 
-    # Run similarity analysis if available
-    try:
-        from interlinked.analyzer.similarity import analyze_similarity
-        analyze_similarity(graph)
-    except Exception:
-        pass
-
     engine = QueryEngine(graph)
 
-    # Start embedding build in background (if torch/transformers installed)
-    try:
-        from interlinked.analyzer.embeddings import EmbeddingIndex, is_available
-        if is_available():
-            from pathlib import Path
-            emb_index = EmbeddingIndex(project_path)
-            engine._embedding_index = emb_index
-            # Collect function sources
-            from interlinked.models import SymbolType
-            functions = []
-            for node in graph.all_nodes(include_proposed=False):
-                if node.symbol_type not in (SymbolType.FUNCTION, SymbolType.METHOD):
-                    continue
-                if node.file_path and node.line_start and node.line_end:
-                    try:
-                        lines = Path(node.file_path).read_text(encoding="utf-8", errors="replace").splitlines()
-                        source = "\n".join(lines[max(0, node.line_start - 1):min(len(lines), node.line_end)])
-                        if source:
-                            functions.append({"id": node.id, "source": source})
-                    except Exception:
-                        pass
-            emb_index.build_async(functions)
-    except Exception:
-        pass
+    # Kick off similarity + embeddings in background (non-blocking)
+    _start_background_analysis(graph, engine, project_path)
 
     return graph, engine
 
@@ -520,7 +520,8 @@ def _dispatch_via_server(name: str, args: dict[str, Any], server_url: str) -> st
         if method == "GET":
             r = httpx.get(url, timeout=30.0)
         else:
-            r = httpx.post(url, json=body, timeout=30.0)
+            timeout = 120.0 if "switch_project" in path else 30.0
+            r = httpx.post(url, json=body, timeout=timeout)
         data = r.json()
 
         # Extract the most useful part of the response for the LLM
@@ -621,8 +622,10 @@ def _dispatch_tool(
 
     elif name == "interlinked_switch_project":
         from interlinked.visualizer.server import _rebuild_graph
-        result = _rebuild_graph(args["path"], graph)
+        result = _rebuild_graph(args["path"], graph, run_similarity=False)
         engine.reset_filter()
+        # Background similarity + embeddings — matches REST API pattern
+        _start_background_analysis(graph, engine, args["path"])
         return json.dumps(result, indent=2)
 
     elif name == "interlinked_edges_between":
