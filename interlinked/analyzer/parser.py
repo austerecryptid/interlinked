@@ -187,7 +187,21 @@ def parse_project(root: str | Path) -> tuple[list[NodeData], list[EdgeData]]:
     nodes: list[NodeData] = []
     edges: list[EdgeData] = []
 
-    py_files = sorted(root.rglob("*.py"))
+    # Skip directories that contain third-party or non-project Python files.
+    # External references are resolved via import/AST analysis, not by parsing venv.
+    _SKIP_DIRS = frozenset({
+        ".venv", "venv", "env", ".env",
+        "node_modules",
+        ".git",
+        "__pycache__",
+        ".tox", ".nox", ".eggs",
+        ".mypy_cache", ".ruff_cache", ".pytest_cache",
+        "build", "dist", ".build",
+    })
+    py_files = sorted(
+        p for p in root.rglob("*.py")
+        if not any(part in _SKIP_DIRS for part in p.relative_to(root).parts)
+    )
 
     # Pass 1: extract all symbols and raw (unresolved) edges
     trees: list[tuple[ast.Module, str, str]] = []

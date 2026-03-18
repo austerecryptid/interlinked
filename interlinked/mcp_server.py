@@ -41,36 +41,39 @@ from interlinked.analyzer.dead_code import detect_dead_code
 from interlinked.commander.query import QueryEngine
 
 
-def _start_background_analysis(graph: CodeGraph, engine: QueryEngine, project_path: str) -> None:
-    """Run similarity + embeddings in background threads (non-blocking).
+def _deferred_background_work(graph: CodeGraph, engine: QueryEngine, project_path: str) -> None:
+    """Run similarity + embeddings in a SINGLE background thread (non-blocking).
 
-    Mirrors the pattern used by the REST API server: parse returns fast,
-    then similarity fingerprinting and embedding builds run in the background.
+    Mirrors the REST API pattern: never spawn competing CPU threads that
+    fight over the GIL with the main event loop. Everything heavy runs
+    sequentially in one thread.
     """
     import threading
 
-    # Similarity in background thread
-    def _run_similarity():
+    def _work():
+        # 1. Similarity fingerprinting (CPU-bound)
         try:
             from interlinked.analyzer.similarity import analyze_similarity
             analyze_similarity(graph)
         except Exception:
             pass
-    threading.Thread(target=_run_similarity, daemon=True, name="mcp-similarity").start()
 
-    # Embeddings in background thread (via build_async which spawns its own thread)
-    try:
-        from interlinked.visualizer.server import _start_embedding_build, _collect_function_sources
-        _start_embedding_build(graph, project_path, engine)
-    except Exception:
-        pass
+        # 2. Embedding build (spawns its own single thread internally via build_async)
+        try:
+            from interlinked.visualizer.server import _start_embedding_build
+            _start_embedding_build(graph, project_path, engine)
+        except Exception:
+            pass
+
+    threading.Thread(target=_work, daemon=True, name="mcp-background").start()
 
 
 def build_graph(project_path: str) -> tuple[CodeGraph, QueryEngine]:
     """Parse a project and build the graph + query engine.
 
     Returns immediately after parsing + dead code detection.
-    Similarity and embeddings run in background threads.
+    Similarity and embeddings are NOT started here — they are deferred
+    to avoid GIL contention with the caller.
     """
     nodes, edges = parse_project(project_path)
     graph = CodeGraph()
@@ -78,10 +81,6 @@ def build_graph(project_path: str) -> tuple[CodeGraph, QueryEngine]:
     detect_dead_code(graph)
 
     engine = QueryEngine(graph)
-
-    # Kick off similarity + embeddings in background (non-blocking)
-    _start_background_analysis(graph, engine, project_path)
-
     return graph, engine
 
 
@@ -95,24 +94,30 @@ def create_mcp_server(project_path: str) -> Server:
     # Lazy state — built on first tool call (only if no web server is running)
     _state: dict[str, Any] = {"graph": None, "engine": None, "ready": False}
 
-    def _check_server(port: int = 8420) -> str | None:
+    async def _check_server(port: int = 8420) -> str | None:
         """Check if the web visualizer is running right now. Returns base URL or None."""
         url = f"http://127.0.0.1:{port}"
         try:
-            r = httpx.get(f"{url}/api/stats", timeout=1.0)
-            if r.status_code == 200:
-                return url
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f"{url}/api/stats", timeout=1.0)
+                if r.status_code == 200:
+                    return url
         except Exception:
             pass
         return None
 
-    def _ensure_ready() -> tuple[CodeGraph, QueryEngine]:
+    async def _ensure_ready() -> tuple[CodeGraph, QueryEngine]:
         if not _state["ready"]:
+            import asyncio
             print(f"Analyzing {project_path} ...", file=sys.stderr)
-            graph, engine = build_graph(project_path)
+            loop = asyncio.get_running_loop()
+            graph, engine = await loop.run_in_executor(None, build_graph, project_path)
             _state["graph"] = graph
             _state["engine"] = engine
             _state["ready"] = True
+            # Deferred: similarity + embeddings in single background thread
+            # Scheduled AFTER build returns so the tool response goes out first
+            _deferred_background_work(graph, engine, project_path)
         return _state["graph"], _state["engine"]
 
     # Pick up API key from env if available
@@ -341,7 +346,7 @@ def create_mcp_server(project_path: str) -> Server:
         try:
             # Handle ui_status first — it doesn't need graph or server proxy
             if name == "interlinked_ui_status":
-                server_url = _check_server()
+                server_url = await _check_server()
                 if server_url:
                     result = json.dumps({
                         "running": True,
@@ -358,20 +363,49 @@ def create_mcp_server(project_path: str) -> Server:
 
             # Handle start_ui — needs to spawn the server process
             if name == "interlinked_start_ui":
+                import asyncio
                 port = arguments.get("port", 8420)
-                result = _start_ui(project_path, port)
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(None, _start_ui, project_path, port)
                 return [TextContent(type="text", text=result)]
 
             # Try proxying through the running web server first
-            server_url = _check_server()
+            server_url = await _check_server()
             if server_url:
-                result = _dispatch_via_server(name, arguments, server_url)
+                result = await _async_dispatch_via_server(name, arguments, server_url)
                 if result is not None:
                     return [TextContent(type="text", text=str(result))]
 
-            # Fall back to direct graph mode
-            graph, engine = _ensure_ready()
-            result = _dispatch_tool(name, arguments, engine, graph, api_key)
+            # switch_project: skip _ensure_ready (would double-parse), rebuild directly
+            import asyncio
+            loop = asyncio.get_running_loop()
+
+            if name == "interlinked_switch_project":
+                from interlinked.visualizer.server import _rebuild_graph
+
+                def _do_switch():
+                    g = _state.get("graph")
+                    if g is None:
+                        g = CodeGraph()
+                    return _rebuild_graph(arguments["path"], g, run_similarity=False), g
+
+                result_dict, graph = await loop.run_in_executor(None, _do_switch)
+                engine = _state.get("engine")
+                if engine is None:
+                    engine = QueryEngine(graph)
+                engine.reset_filter()
+                _state["graph"] = graph
+                _state["engine"] = engine
+                _state["ready"] = True
+                # Deferred: single background thread AFTER response sent
+                _deferred_background_work(graph, engine, arguments["path"])
+                return [TextContent(type="text", text=json.dumps(result_dict, indent=2))]
+
+            # All other tools: ensure graph is built first
+            graph, engine = await _ensure_ready()
+            result = await loop.run_in_executor(
+                None, _dispatch_tool, name, arguments, engine, graph, api_key
+            )
             if name == "interlinked_set_api_key":
                 api_key = arguments.get("api_key", "")
                 os.environ["ANTHROPIC_API_KEY"] = api_key
@@ -543,6 +577,97 @@ def _dispatch_via_server(name: str, args: dict[str, Any], server_url: str) -> st
         return None
 
 
+async def _async_dispatch_via_server(name: str, args: dict[str, Any], server_url: str) -> str | None:
+    """Async proxy — uses httpx.AsyncClient so the MCP event loop isn't blocked."""
+    # Reuse the same endpoint mapping
+    _TOOL_TO_ENDPOINT: dict[str, tuple[str, str, dict]] = {
+        "interlinked_stats":       ("GET",  "/api/stats", {}),
+        "interlinked_isolate":     ("POST", "/api/isolate", {
+            "target": args.get("target", ""),
+            "level": args.get("level", "function"),
+            "depth": args.get("depth", 3),
+            "edge_types": args.get("edge_types"),
+        }),
+        "interlinked_zoom":        ("POST", "/api/zoom", {"level": args.get("level", "module")}),
+        "interlinked_focus":       ("POST", "/api/focus", {
+            "node_id": args.get("node_id", ""),
+            "depth": args.get("depth", 2),
+        }),
+        "interlinked_query":       ("POST", "/api/query", {"expression": args.get("expression", "")}),
+        "interlinked_trace_variable": ("POST", "/api/trace_variable", {
+            "variable": args.get("variable", ""),
+            "origin": args.get("origin"),
+        }),
+        "interlinked_propose_function": ("POST", "/api/propose", {
+            "name": args.get("name", ""),
+            "module": args.get("module", ""),
+            "calls": args.get("calls"),
+            "called_by": args.get("called_by"),
+        }),
+        "interlinked_find_duplicates": ("POST", "/api/find_duplicates", {
+            "threshold": args.get("threshold", 0.6),
+            "scope": args.get("scope"),
+            "kind": args.get("kind"),
+        }),
+        "interlinked_similar_to":  ("POST", "/api/similar_to", {
+            "target": args.get("target", ""),
+            "threshold": args.get("threshold", 0.5),
+        }),
+        "interlinked_get_context": ("POST", "/api/get_context", {"target": args.get("target", "")}),
+        "interlinked_command":     ("POST", "/api/command", {"command": args.get("command", "")}),
+        "interlinked_switch_project": ("POST", "/api/switch_project", {"path": args.get("path", "")}),
+        "interlinked_edges_between": ("POST", "/api/edges_between", {
+            "source_scope": args.get("source_scope", ""),
+            "target_scope": args.get("target_scope"),
+            "edge_types": args.get("edge_types"),
+        }),
+        "interlinked_reachable":   ("POST", "/api/reachable", {
+            "source": args.get("source", ""),
+            "target": args.get("target", ""),
+            "edge_types": args.get("edge_types"),
+            "max_depth": args.get("max_depth", 20),
+        }),
+        "interlinked_reset":       ("POST", "/api/reset", {}),
+        "interlinked_set_context": ("POST", "/api/set_context", {
+            "what": args.get("what", ""),
+            "why": args.get("why", ""),
+            "where": args.get("where", ""),
+        }),
+    }
+
+    if name not in _TOOL_TO_ENDPOINT:
+        return None
+
+    method, path, body = _TOOL_TO_ENDPOINT[name]
+    url = f"{server_url}{path}"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            timeout = 120.0 if "switch_project" in path else 30.0
+            if method == "GET":
+                r = await client.get(url, timeout=timeout)
+            else:
+                r = await client.post(url, json=body, timeout=timeout)
+        data = r.json()
+
+        if "result" in data:
+            result = data["result"]
+            if isinstance(result, (dict, list)):
+                return json.dumps(result, indent=2)
+            return str(result)
+        if "results" in data:
+            results = data["results"]
+            if len(results) > 20:
+                return f"Found {len(results)} results. Showing first 20:\n" + json.dumps(results[:20], indent=2)
+            return json.dumps(results, indent=2)
+        if "error" in data:
+            return f"Error: {data['error']}"
+        return json.dumps(data, indent=2)
+    except Exception as e:
+        print(f"Async server proxy failed for {name}: {e}", file=sys.stderr)
+        return None
+
+
 def _dispatch_tool(
     name: str, args: dict[str, Any],
     engine: QueryEngine, graph: CodeGraph, api_key: str,
@@ -624,8 +749,9 @@ def _dispatch_tool(
         from interlinked.visualizer.server import _rebuild_graph
         result = _rebuild_graph(args["path"], graph, run_similarity=False)
         engine.reset_filter()
-        # Background similarity + embeddings — matches REST API pattern
-        _start_background_analysis(graph, engine, args["path"])
+        # Deferred: similarity + embeddings in a single background thread
+        # (matches REST API: never run competing CPU threads)
+        _deferred_background_work(graph, engine, args["path"])
         return json.dumps(result, indent=2)
 
     elif name == "interlinked_edges_between":
