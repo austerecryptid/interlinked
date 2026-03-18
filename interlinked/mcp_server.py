@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -48,8 +49,6 @@ def _deferred_background_work(graph: CodeGraph, engine: QueryEngine, project_pat
     fight over the GIL with the main event loop. Everything heavy runs
     sequentially in one thread.
     """
-    import threading
-
     def _work():
         # 1. Similarity fingerprinting (CPU-bound)
         try:
@@ -379,7 +378,11 @@ def create_mcp_server(project_path: str) -> Server:
             loop = asyncio.get_running_loop()
 
             if name == "interlinked_switch_project":
-                from interlinked.visualizer.server import _rebuild_graph
+                from interlinked.visualizer.server import (
+                    _rebuild_graph, start_file_watcher, stop_file_watcher,
+                )
+
+                stop_file_watcher()  # stop old watcher before rebuild
 
                 def _do_switch():
                     g = _state.get("graph")
@@ -395,8 +398,11 @@ def create_mcp_server(project_path: str) -> Server:
                 _state["graph"] = graph
                 _state["engine"] = engine
                 _state["ready"] = True
+                _state["project_path"] = arguments["path"]
                 # Deferred: single background thread AFTER response sent
                 _deferred_background_work(graph, engine, arguments["path"])
+                # Start file watcher so graph stays fresh between queries
+                start_file_watcher(graph, arguments["path"])
                 return [TextContent(type="text", text=json.dumps(result_dict, indent=2))]
 
             # All other tools: ensure graph is built first
@@ -735,12 +741,14 @@ def _dispatch_tool(
         return str(result)
 
     elif name == "interlinked_switch_project":
-        from interlinked.visualizer.server import _rebuild_graph
+        from interlinked.visualizer.server import (
+            _rebuild_graph, start_file_watcher, stop_file_watcher,
+        )
+        stop_file_watcher()
         result = _rebuild_graph(args["path"], graph, run_similarity=False)
         engine.reset_filter()
-        # Deferred: similarity + embeddings in a single background thread
-        # (matches REST API: never run competing CPU threads)
         _deferred_background_work(graph, engine, args["path"])
+        start_file_watcher(graph, args["path"])
         return json.dumps(result, indent=2)
 
     elif name == "interlinked_edges_between":

@@ -21,6 +21,121 @@ from interlinked.models import ViewState, NodeData, EdgeData, GraphDelta
 FRONTEND_DIR = Path(__file__).parent / "frontend" / "dist"
 
 
+def apply_file_changes(
+    graph: CodeGraph, root: Path, changes_list: list[tuple[Any, str]]
+) -> None:
+    """Apply incremental file changes to the graph.
+
+    This is the core logic used by the file watcher. Extracted as a
+    top-level function so it can be tested directly.
+
+    Args:
+        graph: The live CodeGraph instance.
+        root: Resolved project root path.
+        changes_list: List of (change_type, file_path_str) tuples from watchfiles.
+    """
+    from interlinked.analyzer.parser import parse_file, path_to_module
+    from interlinked.analyzer.dead_code import detect_dead_code
+
+    for change_type, file_path_str in changes_list:
+        file_path = Path(file_path_str)
+        try:
+            rel_path = file_path.relative_to(root)
+        except ValueError:
+            continue
+
+        module_qname = path_to_module(rel_path)
+
+        # Use string comparison for change type to avoid importing watchfiles
+        # at module level (it's an optional dependency).
+        change_name = getattr(change_type, "name", str(change_type))
+        if change_name == "deleted":
+            graph.remove_file(module_qname)
+        else:
+            existing_ids = {n.id for n in graph.all_nodes()}
+            type_idx: dict[str, str] = {}
+            for n in graph.all_nodes():
+                if n.symbol_type.value in ("module", "class"):
+                    type_idx[n.name] = n.id
+            new_nodes, new_edges = parse_file(
+                file_path, module_qname,
+                existing_node_ids=existing_ids,
+                existing_type_index=type_idx,
+            )
+            graph.update_file(module_qname, new_nodes, new_edges)
+
+    detect_dead_code(graph)
+
+    try:
+        from interlinked.analyzer.similarity import analyze_similarity
+        analyze_similarity(graph)
+    except Exception:
+        pass
+
+
+# ── Unified file watcher ──────────────────────────────────────────────
+
+import threading as _threading
+
+_watcher_stop: _threading.Event | None = None
+
+
+def start_file_watcher(
+    graph: CodeGraph,
+    project_path: str,
+    on_change: Any = None,
+) -> None:
+    """Start a background file watcher. One implementation for all interfaces.
+
+    Watches for .py changes, applies incremental updates (edges, dead code,
+    similarity), then calls on_change(changes) if provided.
+
+    Args:
+        graph: The live CodeGraph instance.
+        project_path: Project root path.
+        on_change: Optional callback(changes_list) for interface-specific
+                   work (embedding updates, SSE push, etc).
+    """
+    stop_file_watcher()
+
+    global _watcher_stop
+    stop_event = _threading.Event()
+    _watcher_stop = stop_event
+    root = Path(project_path).resolve()
+
+    def _watch():
+        try:
+            from watchfiles import watch
+        except ImportError:
+            return
+
+        for changes in watch(
+            root,
+            watch_filter=lambda change, path: path.endswith(".py"),
+            debounce=500,
+            stop_event=stop_event,
+        ):
+            if stop_event.is_set():
+                break
+            changes_list = list(changes)
+            apply_file_changes(graph, root, changes_list)
+            if on_change is not None:
+                try:
+                    on_change(changes_list)
+                except Exception:
+                    pass
+
+    _threading.Thread(target=_watch, daemon=True, name="interlinked-watcher").start()
+
+
+def stop_file_watcher() -> None:
+    """Stop the file watcher if running."""
+    global _watcher_stop
+    if _watcher_stop is not None:
+        _watcher_stop.set()
+        _watcher_stop = None
+
+
 def _rebuild_graph(project_path: str, graph: CodeGraph, run_similarity: bool = True) -> dict:
     """Re-parse a project and rebuild the graph in-place. Returns stats.
 
@@ -633,52 +748,16 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
 
     # ── File watcher for live graph updates ──────────────────────
 
-    _watcher_task: dict[str, Any] = {"task": None}
-
-    async def _watch_project(project_path: str) -> None:
-        """Watch for .py file changes and incrementally update the graph."""
-        from watchfiles import awatch, Change
-        from interlinked.analyzer.parser import parse_file, path_to_module
-        from interlinked.analyzer.dead_code import detect_dead_code
+    def _start_watcher() -> None:
+        """Start (or restart) the unified file watcher."""
         from interlinked.models import ViewContext
 
-        root = Path(project_path).resolve()
-        loop = asyncio.get_running_loop()
+        project_path = app_state.get("project_path", "")
+        if not project_path:
+            return
 
-        def _apply_changes(changes_list):
-            """Synchronous graph mutations — runs in executor thread."""
-            for change_type, file_path_str in changes_list:
-                file_path = Path(file_path_str)
-                try:
-                    rel_path = file_path.relative_to(root)
-                except ValueError:
-                    continue
-
-                module_qname = path_to_module(rel_path)
-
-                if change_type == Change.deleted:
-                    graph.remove_file(module_qname)
-                else:
-                    existing_ids = {n.id for n in graph.all_nodes()}
-                    type_idx: dict[str, str] = {}
-                    for n in graph.all_nodes():
-                        if n.symbol_type.value in ("module", "class"):
-                            type_idx[n.name] = n.id
-                    new_nodes, new_edges = parse_file(
-                        file_path, module_qname,
-                        existing_node_ids=existing_ids,
-                        existing_type_index=type_idx,
-                    )
-                    graph.update_file(module_qname, new_nodes, new_edges)
-
-            detect_dead_code(graph)
-
-            try:
-                from interlinked.analyzer.similarity import analyze_similarity
-                analyze_similarity(graph)
-            except Exception:
-                pass
-
+        def _on_change(changes_list):
+            # Embedding delta update
             emb = app_state.get("embedding_index")
             if emb and emb.status == "ready":
                 try:
@@ -686,34 +765,16 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
                     emb.update_functions(changed_funcs)
                 except Exception:
                     pass
-
-        try:
-            async for changes in awatch(
-                root,
-                watch_filter=lambda change, path: path.endswith(".py"),
-                debounce=500,
-            ):
-                await loop.run_in_executor(None, _apply_changes, list(changes))
-
-                engine.state.context = ViewContext(
-                    what="Live update: files changed on disk",
-                    why=f"{len(changes)} file(s) modified",
-                    where=app_state["project_path"],
-                    source="system",
-                )
-                engine._notify()
-        except asyncio.CancelledError:
-            pass
-
-    def _start_watcher() -> None:
-        """Start (or restart) the file watcher background task."""
-        if _watcher_task["task"] is not None:
-            _watcher_task["task"].cancel()
-        project_path = app_state.get("project_path", "")
-        if project_path:
-            _watcher_task["task"] = asyncio.create_task(
-                _watch_project(project_path)
+            # SSE notify
+            engine.state.context = ViewContext(
+                what="Live update: files changed on disk",
+                why=f"{len(changes_list)} file(s) modified",
+                where=project_path,
+                source="system",
             )
+            engine._notify()
+
+        start_file_watcher(graph, project_path, on_change=_on_change)
 
     @app.on_event("startup")
     async def _on_startup() -> None:

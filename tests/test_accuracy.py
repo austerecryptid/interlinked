@@ -857,7 +857,404 @@ class TestGraphIntegrity:
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 7. PARSER SKIP DIRS — .venv and friends must be excluded
+# 7. INCREMENTAL EDGE FRESHNESS — file watcher must refresh edges
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestIncrementalEdgeFreshness:
+    """Verify the file watcher's incremental update produces fresh edges.
+
+    Calls the real apply_file_changes() from server.py — the exact same
+    function the file watcher uses in production.
+    """
+
+    @staticmethod
+    def _simulate_watcher_change(graph, root: Path, file_path: Path):
+        """Invoke the real watcher logic for a single file change."""
+        from interlinked.visualizer.server import apply_file_changes
+        apply_file_changes(graph, root, [("modified", str(file_path))])
+
+    def test_callees_refresh_after_edit(self):
+        """After changing which function caller_x calls, callees must update."""
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            # v1: caller_x calls target_a
+            (tmpdir / "mod.py").write_text(
+                "def target_a(): return 'a'\n"
+                "def target_b(): return 'b'\n"
+                "def caller_x():\n"
+                "    return target_a()\n"
+            )
+            graph, engine, _, _ = _build(tmpdir)
+
+            caller_id = _find(graph, "caller_x")
+            callees_v1 = {n.name for n in graph.callees_of(caller_id)}
+            assert "target_a" in callees_v1, f"v1 should call target_a, got {callees_v1}"
+            assert "target_b" not in callees_v1, f"v1 should NOT call target_b, got {callees_v1}"
+
+            # v2: caller_x now calls target_b instead
+            (tmpdir / "mod.py").write_text(
+                "def target_a(): return 'a'\n"
+                "def target_b(): return 'b'\n"
+                "def caller_x():\n"
+                "    return target_b()\n"
+            )
+            self._simulate_watcher_change(graph, tmpdir, tmpdir / "mod.py")
+
+            callees_v2 = {n.name for n in graph.callees_of(caller_id)}
+            assert "target_b" in callees_v2, \
+                f"v2 should call target_b after edit, got {callees_v2}"
+            assert "target_a" not in callees_v2, \
+                f"v2 should NOT call target_a after edit (stale edge), got {callees_v2}"
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_new_callees_appear_after_edit(self):
+        """Adding a new call target must show up in callees."""
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            (tmpdir / "mod.py").write_text(
+                "def helper(): return 1\n"
+                "def worker(): return 2\n"
+                "def main():\n"
+                "    return helper()\n"
+            )
+            graph, engine, _, _ = _build(tmpdir)
+
+            main_id = _find(graph, "main")
+            callees_v1 = {n.name for n in graph.callees_of(main_id)}
+            assert "helper" in callees_v1
+            assert "worker" not in callees_v1
+
+            # Now main calls both
+            (tmpdir / "mod.py").write_text(
+                "def helper(): return 1\n"
+                "def worker(): return 2\n"
+                "def main():\n"
+                "    return helper() + worker()\n"
+            )
+            self._simulate_watcher_change(graph, tmpdir, tmpdir / "mod.py")
+
+            callees_v2 = {n.name for n in graph.callees_of(main_id)}
+            assert "helper" in callees_v2, f"helper should still be a callee, got {callees_v2}"
+            assert "worker" in callees_v2, f"worker should appear as new callee, got {callees_v2}"
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_fingerprint_refreshes_after_edit(self):
+        """Fingerprint must reflect the new code, not the old."""
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            (tmpdir / "mod.py").write_text(
+                "def func():\n"
+                "    x = 1\n"
+                "    return x\n"
+            )
+            graph, engine, _, _ = _build(tmpdir)
+
+            func_id = _find(graph, "func")
+            node_v1 = graph.get_node(func_id)
+            fp_v1 = node_v1.metadata.get("fingerprint") if node_v1 else None
+
+            # Significantly change the function body
+            (tmpdir / "mod.py").write_text(
+                "def func():\n"
+                "    for i in range(10):\n"
+                "        if i % 2 == 0:\n"
+                "            yield i\n"
+            )
+            self._simulate_watcher_change(graph, tmpdir, tmpdir / "mod.py")
+
+            node_v2 = graph.get_node(func_id)
+            fp_v2 = node_v2.metadata.get("fingerprint") if node_v2 else None
+
+            assert fp_v2 is not None, "Fingerprint should exist after edit"
+            # v2 has loops and yield, v1 does not
+            assert fp_v2.get("has_loops") is True, \
+                f"Fingerprint should reflect 'for' loop, got {fp_v2}"
+            assert fp_v2.get("has_yield") is True, \
+                f"Fingerprint should reflect 'yield', got {fp_v2}"
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_cross_module_callees_refresh_after_edit(self):
+        """Editing file A which calls functions in file B — callees must update.
+
+        This is the exact production bug: parse_file's name_index only has
+        the edited file's nodes, so bare-name calls to other modules may
+        not resolve through the incremental path.
+        """
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            # Two-file project: caller.py imports from targets.py
+            (tmpdir / "targets.py").write_text(
+                "def old_target(): return 'old'\n"
+                "def new_target(): return 'new'\n"
+            )
+            (tmpdir / "caller.py").write_text(
+                "from targets import old_target\n"
+                "def do_work():\n"
+                "    return old_target()\n"
+            )
+            graph, engine, _, _ = _build(tmpdir)
+
+            caller_id = _find(graph, "do_work")
+            callees_v1 = {n.name for n in graph.callees_of(caller_id)}
+            assert "old_target" in callees_v1, f"v1 should call old_target, got {callees_v1}"
+
+            # Edit caller.py to call new_target instead
+            (tmpdir / "caller.py").write_text(
+                "from targets import new_target\n"
+                "def do_work():\n"
+                "    return new_target()\n"
+            )
+            self._simulate_watcher_change(graph, tmpdir, tmpdir / "caller.py")
+
+            callees_v2 = {n.name for n in graph.callees_of(caller_id)}
+            assert "new_target" in callees_v2, \
+                f"v2 should call new_target after cross-module edit, got {callees_v2}"
+            assert "old_target" not in callees_v2, \
+                f"v2 should NOT call old_target (stale cross-module edge), got {callees_v2}"
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_cross_module_bare_name_after_edit(self):
+        """Editing to call a function by bare name (no import) that exists in another module.
+
+        This matches the production case: _apply_static_ir_effects calls
+        resolve_effects which is defined in a sibling module. The bare name
+        must resolve through _resolve_edge's name_index after update_file.
+        """
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            # Module with target functions
+            pkg = tmpdir / "engine"
+            pkg.mkdir()
+            (pkg / "__init__.py").write_text("")
+            (pkg / "resolver.py").write_text(
+                "def resolve_effects(ctx): return ctx\n"
+                "def apply_core_op(op): return op\n"
+            )
+            # Module that calls them — v1 calls old names
+            (pkg / "ir_exec.py").write_text(
+                "from engine.resolver import resolve_effects\n"
+                "def old_apply(ctx): return ctx\n"
+                "def process():\n"
+                "    return old_apply({})\n"
+            )
+            graph, engine, _, _ = _build(tmpdir)
+
+            proc_id = _find(graph, "process")
+            callees_v1 = {n.name for n in graph.callees_of(proc_id)}
+            assert "old_apply" in callees_v1, f"v1 should call old_apply, got {callees_v1}"
+
+            # v2: process now calls resolve_effects + apply_core_op
+            (pkg / "ir_exec.py").write_text(
+                "from engine.resolver import resolve_effects, apply_core_op\n"
+                "def old_apply(ctx): return ctx\n"
+                "def process():\n"
+                "    ctx = resolve_effects({})\n"
+                "    return apply_core_op(ctx)\n"
+            )
+            self._simulate_watcher_change(graph, tmpdir, pkg / "ir_exec.py")
+
+            callees_v2 = {n.name for n in graph.callees_of(proc_id)}
+            assert "resolve_effects" in callees_v2, \
+                f"v2 should call resolve_effects after edit, got {callees_v2}"
+            assert "apply_core_op" in callees_v2, \
+                f"v2 should call apply_core_op after edit, got {callees_v2}"
+            assert "old_apply" not in callees_v2, \
+                f"v2 should NOT still call old_apply (stale), got {callees_v2}"
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_get_context_callees_fresh_after_edit(self):
+        """get_context must return fresh callees, not stale ones.
+
+        This is the exact symptom reported: get_context shows updated source
+        but old callees because edges weren't refreshed.
+        """
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            (tmpdir / "helpers.py").write_text(
+                "def alpha(): return 'a'\n"
+                "def beta(): return 'b'\n"
+            )
+            (tmpdir / "main.py").write_text(
+                "from helpers import alpha\n"
+                "def entry():\n"
+                "    return alpha()\n"
+            )
+            graph, engine, _, _ = _build(tmpdir)
+
+            entry_id = _find(graph, "entry")
+
+            from interlinked.analyzer.similarity import get_rich_context
+            node_v1 = graph.get_node(entry_id)
+            ctx_v1 = get_rich_context(graph, node_v1)
+            callee_names_v1 = {c["name"] for c in ctx_v1["callees"]}
+            assert "alpha" in callee_names_v1
+
+            # Edit to call beta instead
+            (tmpdir / "main.py").write_text(
+                "from helpers import beta\n"
+                "def entry():\n"
+                "    return beta()\n"
+            )
+            self._simulate_watcher_change(graph, tmpdir, tmpdir / "main.py")
+
+            node_v2 = graph.get_node(entry_id)
+            ctx_v2 = get_rich_context(graph, node_v2)
+            callee_names_v2 = {c["name"] for c in ctx_v2["callees"]}
+            assert "beta" in callee_names_v2, \
+                f"get_context callees should show beta after edit, got {callee_names_v2}"
+            assert "alpha" not in callee_names_v2, \
+                f"get_context callees should NOT show alpha (stale), got {callee_names_v2}"
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_two_files_edited_cross_package_rewire(self):
+        """Exact production scenario: two files edited in one batch.
+
+        resolver.py — adds a new field to a dataclass, wires it through helpers
+        builder.py — rewires imports from old modules to new ones:
+          OLD: from engine.rules.ir_exec import apply_effects
+               from engine.rules.context import Ctx
+          NEW: from engine.rules.resolver import resolve_effects, ResolverContext
+               from engine.systems.scheduler import apply_core_op
+
+        Both files land in one watcher batch. After apply_file_changes,
+        builder.py's callees must show the NEW targets, not the old ones.
+        """
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            # Build a multi-package project structure
+            rules = tmpdir / "engine" / "rules"
+            systems = tmpdir / "engine" / "systems"
+            rules.mkdir(parents=True)
+            systems.mkdir(parents=True)
+            (tmpdir / "engine" / "__init__.py").write_text("")
+            (rules / "__init__.py").write_text("")
+            (systems / "__init__.py").write_text("")
+
+            # Old modules (v1)
+            (rules / "ir_exec.py").write_text(
+                "def apply_effects(ctx, effects): return ctx\n"
+            )
+            (rules / "context.py").write_text(
+                "class Ctx:\n"
+                "    def __init__(self): self.data = {}\n"
+            )
+            (rules / "resolver.py").write_text(
+                "class ResolverContext:\n"
+                "    def __init__(self): self.mods = []\n"
+                "def resolve_effects(ctx, effects): return []\n"
+            )
+            (systems / "scheduler.py").write_text(
+                "def apply_core_op(world, op): pass\n"
+            )
+
+            # builder.py v1 — imports from old modules
+            (rules / "builder.py").write_text(
+                "from engine.rules.ir_exec import apply_effects\n"
+                "from engine.rules.context import Ctx\n"
+                "def _apply_static_ir_effects(world, effects):\n"
+                "    ctx = Ctx()\n"
+                "    return apply_effects(ctx, effects)\n"
+            )
+
+            graph, engine, _, _ = _build(tmpdir)
+
+            fn_id = _find(graph, "_apply_static_ir_effects")
+            callees_v1 = {n.name for n in graph.callees_of(fn_id)}
+            assert "apply_effects" in callees_v1 or "Ctx" in callees_v1, \
+                f"v1 should call apply_effects/Ctx, got {callees_v1}"
+
+            # ── Edit both files in one batch (what the watcher sees) ──
+
+            # resolver.py v2 — add collect_mods_fn field
+            (rules / "resolver.py").write_text(
+                "class ResolverContext:\n"
+                "    def __init__(self):\n"
+                "        self.mods = []\n"
+                "        self.collect_mods_fn = None\n"
+                "def resolve_effects(ctx, effects): return []\n"
+            )
+
+            # builder.py v2 — rewire to new imports
+            (rules / "builder.py").write_text(
+                "from engine.rules.resolver import resolve_effects, ResolverContext\n"
+                "from engine.systems.scheduler import apply_core_op\n"
+                "def _apply_static_ir_effects(world, effects):\n"
+                "    ctx = ResolverContext()\n"
+                "    ops = resolve_effects(ctx, effects)\n"
+                "    for op in ops:\n"
+                "        apply_core_op(world, op)\n"
+            )
+
+            # Simulate watcher batch — both files in one call
+            from interlinked.visualizer.server import apply_file_changes
+            apply_file_changes(graph, tmpdir, [
+                ("modified", str(rules / "resolver.py")),
+                ("modified", str(rules / "builder.py")),
+            ])
+
+            callees_v2 = {n.name for n in graph.callees_of(fn_id)}
+            assert "resolve_effects" in callees_v2, \
+                f"v2 should call resolve_effects, got {callees_v2}"
+            assert "ResolverContext" in callees_v2, \
+                f"v2 should call ResolverContext, got {callees_v2}"
+            assert "apply_core_op" in callees_v2, \
+                f"v2 should call apply_core_op, got {callees_v2}"
+            assert "apply_effects" not in callees_v2, \
+                f"v2 should NOT call old apply_effects (stale), got {callees_v2}"
+            assert "Ctx" not in callees_v2, \
+                f"v2 should NOT call old Ctx (stale), got {callees_v2}"
+
+            # Also verify via get_rich_context (the exact API that was stale)
+            from interlinked.analyzer.similarity import get_rich_context
+            node = graph.get_node(fn_id)
+            ctx = get_rich_context(graph, node)
+            ctx_callee_names = {c["name"] for c in ctx["callees"]}
+            assert "resolve_effects" in ctx_callee_names, \
+                f"get_rich_context callees stale: {ctx_callee_names}"
+            assert "apply_effects" not in ctx_callee_names, \
+                f"get_rich_context callees stale (old target): {ctx_callee_names}"
+        finally:
+            shutil.rmtree(tmpdir)
+
+    def test_removed_function_edges_cleaned(self):
+        """Removing a function via file edit must remove its edges."""
+        tmpdir = Path(tempfile.mkdtemp())
+        try:
+            (tmpdir / "mod.py").write_text(
+                "def old_func(): return 'old'\n"
+                "def caller():\n"
+                "    return old_func()\n"
+            )
+            graph, engine, _, _ = _build(tmpdir)
+            assert any("old_func" in e.target for e in graph.all_edges()), \
+                "old_func should have edges initially"
+
+            # Remove old_func
+            (tmpdir / "mod.py").write_text(
+                "def new_func(): return 'new'\n"
+                "def caller():\n"
+                "    return new_func()\n"
+            )
+            self._simulate_watcher_change(graph, tmpdir, tmpdir / "mod.py")
+
+            for e in graph.all_edges():
+                assert "old_func" not in e.source and "old_func" not in e.target, \
+                    f"Stale edge referencing old_func: {e.source} -> {e.target}"
+            assert any("new_func" in e.target for e in graph.all_edges()), \
+                "new_func edges should exist after edit"
+        finally:
+            shutil.rmtree(tmpdir)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# 8. PARSER SKIP DIRS — .venv and friends must be excluded
 # ══════════════════════════════════════════════════════════════════════
 
 
