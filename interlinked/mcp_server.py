@@ -108,16 +108,14 @@ def create_mcp_server(project_path: str) -> Server:
 
     async def _ensure_ready() -> tuple[CodeGraph, QueryEngine]:
         if not _state["ready"]:
-            import asyncio
-            print(f"Analyzing {project_path} ...", file=sys.stderr)
-            loop = asyncio.get_running_loop()
-            graph, engine = await loop.run_in_executor(None, build_graph, project_path)
+            # Start empty — require switch_project to load a project.
+            # Windsurf spawns MCP with unpredictable cwd, so we never
+            # auto-parse to avoid scanning / or ~.
+            graph = CodeGraph()
+            engine = QueryEngine(graph)
             _state["graph"] = graph
             _state["engine"] = engine
             _state["ready"] = True
-            # Deferred: similarity + embeddings in single background thread
-            # Scheduled AFTER build returns so the tool response goes out first
-            _deferred_background_work(graph, engine, project_path)
         return _state["graph"], _state["engine"]
 
     # Pick up API key from env if available
@@ -256,7 +254,7 @@ def create_mcp_server(project_path: str) -> Server:
             ),
             Tool(
                 name="interlinked_switch_project",
-                description="Switch to analyzing a different Python project. Re-parses the new project and rebuilds the entire graph.",
+                description="Switch to analyzing a different Python project. Re-parses the new project and rebuilds the entire graph. Must be called before any other tool — the server starts with no project loaded.",
                 inputSchema={
                     "type": "object",
                     "properties": {

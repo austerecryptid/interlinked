@@ -43,3 +43,4 @@ interlinked/visualizer/frontend/node_modules/
 *.log
 .env
 interlinked/.interlinked/embeddings.db
+.interlinked/embeddings.db
