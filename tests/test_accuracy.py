@@ -917,6 +917,91 @@ class TestParserSkipDirs:
 # ══════════════════════════════════════════════════════════════════════
 
 
+class TestFalsePositiveEdges:
+    """Regression tests for false positive edge resolution.
+
+    These patterns caused incorrect edges in production:
+    - effect.get(), args.items() — dotted builtin methods not caught
+    - logger.warning() — logging method resolving to project symbols
+    - _resolve_entity_ref — same-name function in sibling module
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.graph, self.engine, _, _ = _build(FIXTURES)
+
+    def _edge_targets_from(self, source_partial: str, edge_type: EdgeType | None = None) -> set[str]:
+        """All edge targets from a source matching partial name."""
+        src = _find(self.graph, source_partial)
+        return {
+            e.target for e in self.graph.all_edges()
+            if e.source == src
+            and (edge_type is None or e.edge_type == edge_type)
+        }
+
+    def test_dict_get_not_resolved(self):
+        """effect.get('value') must NOT create a call to any project symbol."""
+        targets = self._edge_targets_from("dict_method_calls", EdgeType.CALLS)
+        # "effect.get" should not resolve to anything with ".get" in it
+        assert not any(t.endswith(".get") for t in targets), \
+            f"dict.get() false positive: {[t for t in targets if '.get' in t]}"
+
+    def test_dict_items_not_resolved(self):
+        """args.items() must NOT create a call to any project symbol."""
+        targets = self._edge_targets_from("dict_method_calls", EdgeType.CALLS)
+        assert not any(t.endswith(".items") for t in targets), \
+            f"dict.items() false positive: {[t for t in targets if '.items' in t]}"
+
+    def test_list_extend_not_resolved(self):
+        """ops.extend() must NOT resolve to a project symbol."""
+        targets = self._edge_targets_from("dict_method_calls", EdgeType.CALLS)
+        assert not any(t.endswith(".extend") for t in targets), \
+            f"list.extend() false positive: {[t for t in targets if '.extend' in t]}"
+
+    def test_list_append_not_resolved(self):
+        """collected.append() must NOT resolve to a project symbol."""
+        targets = self._edge_targets_from("dict_method_calls", EdgeType.CALLS)
+        assert not any(t.endswith(".append") and "." in t.rsplit(".append", 1)[0] for t in targets), \
+            f"list.append() false positive: {[t for t in targets if '.append' in t]}"
+
+    def test_str_startswith_not_resolved(self):
+        """ref.startswith() must NOT resolve to a project symbol."""
+        targets = self._edge_targets_from("dict_method_calls", EdgeType.CALLS)
+        assert not any(t.endswith(".startswith") for t in targets), \
+            f"str.startswith() false positive: {[t for t in targets if '.startswith' in t]}"
+
+    def test_str_split_not_resolved(self):
+        """ref.split() must NOT resolve to a project symbol."""
+        targets = self._edge_targets_from("dict_method_calls", EdgeType.CALLS)
+        assert not any(t.endswith(".split") for t in targets), \
+            f"str.split() false positive: {[t for t in targets if '.split' in t]}"
+
+    def test_logger_warning_not_resolved(self):
+        """logger.warning() must NOT create edges to project symbols."""
+        targets = self._edge_targets_from("logging_calls", EdgeType.CALLS)
+        # Should not resolve to any project node
+        node_ids = _node_ids(self.graph)
+        resolved_to_project = targets & node_ids
+        bad = {t for t in resolved_to_project if "warning" in t or "error" in t or "info" in t or "debug" in t}
+        assert not bad, \
+            f"logging calls resolved to project symbols: {bad}"
+
+    def test_same_name_helper_resolves_locally(self):
+        """calls_shared_helper() should call THIS module's _shared_helper."""
+        caller = _find(self.graph, "calls_shared_helper")
+        targets = {
+            e.target for e in self.graph.all_edges()
+            if e.source == caller and e.edge_type == EdgeType.CALLS
+        }
+        # Should resolve to false_positive_edges._shared_helper, not another module's
+        local_match = [t for t in targets if "false_positive_edges._shared_helper" in t]
+        foreign_match = [t for t in targets if "_shared_helper" in t and "false_positive_edges" not in t]
+        assert local_match, \
+            f"calls_shared_helper should call local _shared_helper, got: {targets}"
+        assert not foreign_match, \
+            f"calls_shared_helper resolved to foreign _shared_helper: {foreign_match}"
+
+
 class TestMCPFidelity:
     """Verify MCP dispatch produces the same results as direct engine calls."""
 

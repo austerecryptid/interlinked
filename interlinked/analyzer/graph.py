@@ -15,6 +15,7 @@ from interlinked.models import (
 # Method names so common on builtins (dict, list, set, str, etc.) that resolving
 # them to project symbols by bare-name matching is almost always a false positive.
 # e.g. `op_dict.items()` should NOT resolve to `ActionCost.items`.
+# Checked against the LAST component of dotted targets (e.g. "effect.get" → "get").
 _BUILTIN_METHOD_NAMES: frozenset[str] = frozenset({
     # dict
     "items", "keys", "values", "get", "pop", "update", "setdefault",
@@ -28,8 +29,9 @@ _BUILTIN_METHOD_NAMES: frozenset[str] = frozenset({
     # str
     "strip", "split", "join", "replace", "startswith", "endswith",
     "lower", "upper", "format", "encode", "decode",
-    # general
+    # general / logging
     "close", "read", "write", "flush", "seek", "tell",
+    "warning", "error", "info", "debug", "exception", "critical",
 })
 
 
@@ -236,36 +238,48 @@ class CodeGraph:
                 source = next(iter(candidates))
 
         if target not in node_ids:
-            # Never resolve bare builtin method names — they match too
-            # broadly (e.g. "items" matching ActionCost.items when the
-            # actual call is dict.items()).
-            if target in _BUILTIN_METHOD_NAMES:
+            # Check the last dotted component against builtin method names.
+            # Catches both bare "items" and dotted "effect.get", "args.items".
+            leaf = target.rsplit(".", 1)[-1]
+            if leaf in _BUILTIN_METHOD_NAMES:
                 return edge
+
+            # Dotted targets like "effect.get" or "logger.warning" where the
+            # root is NOT a known node are local-variable method calls —
+            # resolving them through the name index produces false positives.
+            if "." in target:
+                root = target.split(".", 1)[0]
+                # If the root isn't itself a project node, it's a local var
+                if root not in node_ids and root not in name_index:
+                    return edge
 
             candidates = name_index.get(target, set())
             if len(candidates) == 1:
                 target = next(iter(candidates))
             elif len(candidates) > 1:
-                # For CALLS edges, a bare name like `process()` in Python
-                # NEVER resolves to the same class — you need `self.process()`
-                # for that.  Exclude the source itself to prevent self-call
-                # artifacts, and prefer module-level over class-level.
+                # Exclude self-calls (bare `process()` != `self.process()`)
                 filtered = candidates - {source}
                 if not filtered:
                     filtered = candidates
 
-                # Extract the top-level module from the source
+                # Prefer candidates sharing the longest common prefix with
+                # the source.  This ensures a call from engine.rules.resolver
+                # to _resolve_entity_ref picks resolver's own definition
+                # over engine.rules.field_paths._resolve_entity_ref.
                 src_parts = source.split(".")
-                src_module = src_parts[0] if src_parts else source
 
-                # Score candidates: prefer same module, then shorter paths
-                # (module-level functions are shorter than class methods)
-                best = None
-                for c in filtered:
-                    if c.startswith(src_module + "."):
-                        if best is None or c.count(".") < best.count("."):
-                            best = c
-                target = best or next(iter(filtered))
+                def _common_prefix_len(c: str) -> int:
+                    c_parts = c.split(".")
+                    n = 0
+                    for a, b in zip(src_parts, c_parts):
+                        if a == b:
+                            n += 1
+                        else:
+                            break
+                    return n
+
+                best = max(filtered, key=lambda c: (_common_prefix_len(c), -c.count(".")))
+                target = best
 
         if source == edge.source and target == edge.target:
             return edge

@@ -34,6 +34,7 @@ import warnings
 from pathlib import Path
 from typing import Any
 
+from interlinked.analyzer.graph import _BUILTIN_METHOD_NAMES
 from interlinked.models import NodeData, EdgeData, SymbolType, EdgeType
 
 # Python builtins we should never create nodes/edges for
@@ -323,7 +324,17 @@ def parse_project(root: str | Path) -> tuple[list[NodeData], list[EdgeData]]:
                     metadata=e.metadata,
                 ))
             else:
-                # Keep the raw call target — external library calls visible to auditors
+                # Keep the raw call target — external library calls visible
+                # to auditors.  BUT filter out localvar.builtin_method()
+                # patterns: if the inferencer couldn't resolve the target
+                # and the leaf is a common builtin method name, it's almost
+                # certainly a dict/list/str/logging method on a local var
+                # (e.g. effect.get(), args.items(), logger.warning()).
+                # Real project method calls resolve through the type system.
+                if "." in raw_target:
+                    leaf = raw_target.rsplit(".", 1)[-1]
+                    if leaf in _BUILTIN_METHOD_NAMES:
+                        continue
                 resolved_edges.append(e)
             continue
 
