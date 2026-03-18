@@ -1049,17 +1049,14 @@ function StatusBar({ message, viewState }: { message: string; viewState: ViewSta
   }, [volume]);
 
   return (
-    <div className="status-bar">
-      <span className="status-dot" />
-      <span className="status-msg">{message}</span>
-      {viewState && (
-        <span style={{ color: '#2a4a6a' }}>
-          ZOOM:{viewState.zoom_level.toUpperCase()} // VIEW:{viewState.visible_node_ids.length || 'ALL'}
-        </span>
-      )}
+    <div className="status-bar" style={{ display: 'flex', alignItems: 'center' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: '1 1 0', minWidth: 0 }}>
+        <span className="status-dot" />
+        <span className="status-msg">{message}</span>
+      </div>
 
-      {/* Radio */}
-      <div className="radio-container">
+      {/* Radio — centered */}
+      <div className="radio-container" style={{ flex: '0 0 auto' }}>
         <select
           className="radio-station-select"
           value={stationIdx}
@@ -1087,6 +1084,14 @@ function StatusBar({ message, viewState }: { message: string; viewState: ViewSta
           <div className="radio-nowplaying">
             <span className="radio-nowplaying-text">{nowPlaying}</span>
           </div>
+        )}
+      </div>
+
+      <div style={{ flex: '1 1 0', display: 'flex', justifyContent: 'flex-end', minWidth: 0 }}>
+        {viewState && (
+          <span style={{ color: '#2a4a6a', whiteSpace: 'nowrap' }}>
+            ZOOM:{viewState.zoom_level.toUpperCase()} // VIEW:{viewState.visible_node_ids.length || 'ALL'}
+          </span>
         )}
       </div>
     </div>
