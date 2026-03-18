@@ -72,6 +72,14 @@ def parse_project_treesitter(
             nodes.extend(file_nodes)
             edges.extend(file_edges)
 
+    # Optional: resolve unqualified targets via stack graphs
+    try:
+        from interlinked.analyzer.treesitter.resolver import is_available, resolve_edges
+        if is_available():
+            edges = resolve_edges(str(root), adapter.name, nodes, edges)
+    except ImportError:
+        pass
+
     return nodes, edges
 
 
