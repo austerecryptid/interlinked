@@ -23,7 +23,9 @@ Additionally detects:
 
 from __future__ import annotations
 
+import ast
 from collections import deque
+from pathlib import Path
 
 from interlinked.analyzer.graph import CodeGraph
 from interlinked.models import EdgeType, SymbolType
@@ -76,14 +78,26 @@ def detect_dead_code(graph: CodeGraph) -> list[str]:
             if base_short in _SERIALIZABLE_BASES:
                 serializable_class_ids.add(cls_id)
 
+    # ── Parse __all__ from module source files ──────────────────────
+    # Symbols listed in __all__ are public API — always alive.
+    all_exports: set[str] = set()
+    for n in all_nodes:
+        if n.symbol_type == SymbolType.MODULE and n.file_path:
+            exported = _parse_dunder_all(n.file_path)
+            for name in exported:
+                all_exports.add(f"{n.id}.{name}")
+
     # ── Identify production entry points ──────────────────────────
     # Modules are roots — their scope-level code runs on import.
     # Dunder methods and framework hooks are implicitly invoked.
+    # Symbols in __all__ are public API exports.
     entry_points: set[str] = set()
     for n in all_nodes:
         if n.symbol_type == SymbolType.MODULE:
             entry_points.add(n.id)
         elif n.name in _EXEMPT_NAMES:
+            entry_points.add(n.id)
+        elif n.id in all_exports:
             entry_points.add(n.id)
 
     # ── Forward BFS from production entry points ──────────────────
@@ -108,16 +122,19 @@ def detect_dead_code(graph: CodeGraph) -> list[str]:
                 if child not in reachable:
                     queue.append(child)
 
-    # ── Mark unreachable functions/methods as dead ─────────────────
+    # ── Mark unreachable functions/methods/classes as dead ──────────
     dead: set[str] = set()
     for n in all_nodes:
-        if n.symbol_type not in (SymbolType.FUNCTION, SymbolType.METHOD):
+        if n.symbol_type not in (SymbolType.FUNCTION, SymbolType.METHOD, SymbolType.CLASS):
             continue
         # Test functions are not dead — they're tests
-        if n.name.startswith("test_"):
+        if n.name.startswith("test_") or n.name.startswith("Test"):
             continue
         # Exempt names are never dead
         if n.name in _EXEMPT_NAMES:
+            continue
+        # __all__ exports are never dead
+        if n.id in all_exports:
             continue
         # If not reachable from any production entry point → dead
         if n.id not in reachable:
@@ -200,3 +217,29 @@ def detect_dead_code(graph: CodeGraph) -> list[str]:
                 e.is_dead = True
 
     return list(dead)
+
+
+def _parse_dunder_all(file_path: str) -> list[str]:
+    """Extract names from a static ``__all__ = [...]`` assignment.
+
+    Only handles literal list/tuple assignments — dynamic __all__ (e.g.
+    comprehensions, += mutations) are not supported by design.
+    """
+    try:
+        source = Path(file_path).read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source, filename=file_path)
+    except (SyntaxError, OSError):
+        return []
+
+    for node in ast.iter_child_nodes(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id == "__all__":
+                if isinstance(node.value, (ast.List, ast.Tuple)):
+                    return [
+                        elt.value
+                        for elt in node.value.elts
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                    ]
+    return []

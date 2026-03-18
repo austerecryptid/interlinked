@@ -42,6 +42,22 @@ _BUILTINS: frozenset[str] = frozenset(dir(builtins)) | frozenset({
     "__all__", "__spec__", "__loader__", "__package__", "__builtins__",
 })
 
+# Known higher-order call patterns where a positional argument is the
+# callable being invoked.  Maps (attr_suffix) -> positional index of
+# the callable arg.  Also supports keyword argument names via _CALLABLE_KWARGS.
+_CALLABLE_ARG_INDEX: dict[str, int] = {
+    "run_in_executor": 1,       # loop.run_in_executor(executor, fn, ...)
+    "submit": 1,                # executor.submit(fn, ...)
+    "map": 0,                   # map(fn, iterable) / pool.map(fn, iterable)
+    "apply": 0,                 # pool.apply(fn, ...)
+    "apply_async": 0,           # pool.apply_async(fn, ...)
+    "partial": 0,               # functools.partial(fn, ...)
+}
+_CALLABLE_KWARGS: dict[str, str] = {
+    "Thread": "target",         # threading.Thread(target=fn)
+    "Process": "target",        # multiprocessing.Process(target=fn)
+}
+
 
 
 def parse_file(
@@ -74,7 +90,7 @@ def parse_file(
         return [], []
 
     # Pass 1: extract symbols and raw edges
-    nodes, edges = _extract_from_module(tree, source, module_qname, str(file_path))
+    nodes, edges, _aliases = _extract_from_module(tree, source, module_qname, str(file_path))
 
     # Build combined node ID set and type index
     node_ids = {n.id for n in nodes}
@@ -186,6 +202,7 @@ def parse_project(root: str | Path) -> tuple[list[NodeData], list[EdgeData]]:
     root = Path(root).resolve()
     nodes: list[NodeData] = []
     edges: list[EdgeData] = []
+    all_import_aliases: dict[str, str] = {}  # local_name -> import target
 
     # Skip directories that contain third-party or non-project Python files.
     # External references are resolved via import/AST analysis, not by parsing venv.
@@ -218,11 +235,12 @@ def parse_project(root: str | Path) -> tuple[list[NodeData], list[EdgeData]]:
         module_qname = _path_to_module(rel_path)
         trees.append((tree, module_qname, str(py_file)))
 
-        file_nodes, file_edges = _extract_from_module(
+        file_nodes, file_edges, file_aliases = _extract_from_module(
             tree, source, module_qname, str(py_file)
         )
         nodes.extend(file_nodes)
         edges.extend(file_edges)
+        all_import_aliases.update(file_aliases)
 
     # Pass 2: type inference from annotations
     node_ids = {n.id for n in nodes}
@@ -253,6 +271,22 @@ def parse_project(root: str | Path) -> tuple[list[NodeData], list[EdgeData]]:
             suffix = ".".join(parts[i:])
             name_index.setdefault(suffix, []).append(n.id)
 
+    # Inject import aliases into name_index so aliased names resolve
+    # through the same path as their real targets.
+    # e.g. alias "process_data" -> "tests.fixtures.shadowing.process"
+    #   name_index already has "process" -> [shadowing.process, ...]
+    #   We find the target's suffix in name_index and copy its candidates.
+    for alias_name, alias_target in all_import_aliases.items():
+        if alias_name in name_index:
+            continue  # don't clobber real nodes
+        # Try the full target, then progressively shorter suffixes
+        target_parts = alias_target.split(".")
+        for i in range(len(target_parts)):
+            suffix = ".".join(target_parts[i:])
+            if suffix in name_index:
+                name_index[alias_name] = name_index[suffix]
+                break
+
     # Pass 4: resolve all data-flow edges, progressive truncation, drop external
     #
     # Edge type handling:
@@ -264,8 +298,12 @@ def parse_project(root: str | Path) -> tuple[list[NodeData], list[EdgeData]]:
     #   CONTAINS / INHERITS — pass through unchanged.
     resolved_edges: list[EdgeData] = []
     for e in edges:
-        # Structural edges — always keep
+        # Structural edges — always keep, except external IMPORTS
         if e.edge_type not in (EdgeType.READS, EdgeType.WRITES, EdgeType.CALLS, EdgeType.RETURNS):
+            if e.edge_type == EdgeType.IMPORTS and e.target not in node_ids:
+                # Drop imports to external modules (asyncio, typing, etc.)
+                if not any(nid.startswith(e.target + ".") or nid == e.target for nid in node_ids):
+                    continue
             resolved_edges.append(e)
             continue
 
@@ -381,7 +419,7 @@ def _extract_from_module(
     # Field(...) in Pydantic models, etc.
     visitor._extract_scope_level_calls(tree, module_qname)
 
-    return nodes, edges
+    return nodes, edges, visitor._import_aliases
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +446,7 @@ class _SymbolVisitor(ast.NodeVisitor):
         self._edges = edges
         self._scope_stack: list[str] = [module_qname]
         self._node_ids: set[str] = set()
+        self._import_aliases: dict[str, str] = {}  # local_name -> qualified target
 
     @property
     def _current_scope(self) -> str:
@@ -529,6 +568,8 @@ class _SymbolVisitor(ast.NodeVisitor):
                 source=self._module, target=alias.name,
                 edge_type=EdgeType.IMPORTS, line=node.lineno,
             ))
+            local_name = alias.asname or alias.name
+            self._import_aliases[local_name] = alias.name
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         base = node.module or ""
@@ -538,6 +579,9 @@ class _SymbolVisitor(ast.NodeVisitor):
                 source=self._module, target=target,
                 edge_type=EdgeType.IMPORTS, line=node.lineno,
             ))
+            # Track aliases: 'from X import Y as Z' -> Z maps to X.Y
+            local_name = alias.asname or alias.name
+            self._import_aliases[local_name] = target
 
     # -- Assignments at module / class scope --------------------------------
 
@@ -654,10 +698,39 @@ class _SymbolVisitor(ast.NodeVisitor):
             ))
 
     def _extract_calls(self, func_node: ast.AST, caller_qname: str) -> None:
-        """Emit raw CALLS edges. Targets are unresolved (e.g. 'self.add_node')."""
+        """Emit raw CALLS edges. Targets are unresolved (e.g. 'self.add_node').
+
+        Also detects known callable-passing patterns like
+        ``loop.run_in_executor(None, fn)`` and ``Thread(target=fn)``
+        and emits an additional CALLS edge to the callable argument.
+        """
         for node in ast.walk(func_node):
             if not isinstance(node, ast.Call):
                 continue
+
+            # Detect super().method() — Call(func=Attr(value=Call(func=Name('super'))))
+            if (isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Call)
+                    and isinstance(node.func.value.func, ast.Name)
+                    and node.func.value.func.id == "super"):
+                method_name = node.func.attr
+                # Find the enclosing class and its base classes from
+                # already-emitted inherits edges
+                class_scope = self._class_scope()
+                if class_scope:
+                    for edge in self._edges:
+                        if edge.source == class_scope and edge.edge_type == EdgeType.INHERITS:
+                            # Emit call to parent.method — resolution will
+                            # match it to the actual qualified name
+                            super_target = f"{edge.target}.{method_name}"
+                            self._edges.append(EdgeData(
+                                source=caller_qname, target=super_target,
+                                edge_type=EdgeType.CALLS,
+                                line=getattr(node, "lineno", None),
+                            ))
+                            break  # MRO: first base class
+                continue
+
             callee = _name_from_node(node.func)
             if not callee:
                 continue
@@ -686,6 +759,34 @@ class _SymbolVisitor(ast.NodeVisitor):
                 line=getattr(node, "lineno", None),
                 metadata=metadata,
             ))
+
+            # Detect callable-passing patterns and emit CALLS to the
+            # actual callable argument.
+            callee_tail = callee.rsplit(".", 1)[-1]
+
+            # Positional callable arg: e.g. run_in_executor(None, fn)
+            idx = _CALLABLE_ARG_INDEX.get(callee_tail)
+            if idx is not None and idx < len(node.args):
+                fn_name = _name_from_node(node.args[idx])
+                if fn_name and fn_name not in _BUILTINS:
+                    self._edges.append(EdgeData(
+                        source=caller_qname, target=fn_name,
+                        edge_type=EdgeType.CALLS,
+                        line=getattr(node, "lineno", None),
+                    ))
+
+            # Keyword callable arg: e.g. Thread(target=fn)
+            kw_param = _CALLABLE_KWARGS.get(callee_tail)
+            if kw_param:
+                for kw in node.keywords:
+                    if kw.arg == kw_param:
+                        fn_name = _name_from_node(kw.value)
+                        if fn_name and fn_name not in _BUILTINS:
+                            self._edges.append(EdgeData(
+                                source=caller_qname, target=fn_name,
+                                edge_type=EdgeType.CALLS,
+                                line=getattr(node, "lineno", None),
+                            ))
 
     def _extract_variable_access(self, func_node: ast.AST, scope_qname: str) -> None:
         """Emit raw READS/WRITES edges. Targets are unresolved."""
@@ -880,7 +981,12 @@ class _TypeInferencer:
         return None
 
     def _resolve_subscript_inner(self, ann: ast.AST) -> str | None:
-        """For list[NodeData] or set[X], resolve the element type."""
+        """For list[X], set[X], Generator[Y,S,R], Iterator[X], resolve the element type.
+
+        For single-arg subscripts (list[X], Iterator[X]): returns X.
+        For multi-arg subscripts: tries first element (Generator[Yield,...]),
+        then last (dict[K, V]).
+        """
         if isinstance(ann, ast.Subscript):
             sl = ann.slice
             if isinstance(sl, ast.Name):
@@ -888,8 +994,12 @@ class _TypeInferencer:
             if isinstance(sl, ast.Attribute):
                 dotted = _name_from_node(sl)
                 return self._type_index.get(dotted) if dotted else None
-            # dict[K, V] -- return V for .values() iteration
             if isinstance(sl, ast.Tuple) and len(sl.elts) >= 2:
+                # Try first element (Generator[Yield, Send, Return], Iterator[X])
+                first = self._resolve_annotation(sl.elts[0])
+                if first:
+                    return first
+                # Fall back to last element (dict[K, V])
                 return self._resolve_annotation(sl.elts[-1])
         # Handle X | None wrapping
         if isinstance(ann, ast.BinOp) and isinstance(ann.op, ast.BitOr):
@@ -968,17 +1078,14 @@ class _TypeInferencer:
                                         self._var_types[(func_qname, target.attr)] = resolved
 
                             # Case B: method call — x = obj.method()
+                            # Also handles Class.classmethod() and Class.staticmethod()
                             elif "." in callee and isinstance(target, ast.Name):
-                                obj_name, method = callee.rsplit(".", 1)
-                                cls = self._resolve_var_type(obj_name, func_qname)
-                                if cls:
-                                    method_qname = f"{cls}.{method}"
-                                    ret_ann = self._return_types.get(method_qname)
-                                    if ret_ann:
-                                        ret_type = self._resolve_annotation(ret_ann)
-                                        if ret_type:
-                                            self._var_types[(func_qname, target.id)] = ret_type
-                                        local_annotations[target.id] = ret_ann
+                                ret_ann = self._lookup_return_type(callee, func_qname)
+                                if ret_ann:
+                                    ret_type = self._resolve_annotation(ret_ann)
+                                    if ret_type:
+                                        self._var_types[(func_qname, target.id)] = ret_type
+                                    local_annotations[target.id] = ret_ann
 
                     # Case C: assignment type propagation
                     # self.x = param  or  x = other_typed_var
@@ -1018,6 +1125,31 @@ class _TypeInferencer:
                             if elem_type:
                                 self._var_types[(func_qname, gen.target.id)] = elem_type
 
+                # Except-as variable typing:
+                # `except AppError as e` -> e is typed as AppError
+                elif isinstance(child, ast.ExceptHandler):
+                    if child.name and child.type:
+                        exc_name = _name_from_node(child.type)
+                        if exc_name:
+                            exc_class = self._type_index.get(exc_name)
+                            if exc_class:
+                                self._var_types[(func_qname, child.name)] = exc_class
+
+                # With / async-with as-variable typing:
+                # `with X() as var` -> var's type is X.__enter__ return annotation
+                # `async with X() as var` -> X.__aenter__ return annotation
+                elif isinstance(child, (ast.With, ast.AsyncWith)):
+                    is_async = isinstance(child, ast.AsyncWith)
+                    for item in child.items:
+                        if item.optional_vars and isinstance(item.optional_vars, ast.Name):
+                            var_name = item.optional_vars.id
+                            cm_type = self._infer_context_manager_type(
+                                item.context_expr, func_qname, is_async,
+                                local_annotations, param_annotations,
+                            )
+                            if cm_type:
+                                self._var_types[(func_qname, var_name)] = cm_type
+
     def _infer_iter_element_type(
         self,
         it: ast.AST,
@@ -1040,7 +1172,7 @@ class _TypeInferencer:
                     if inner:
                         return inner
 
-        # Case 2: for x in obj.method() -- resolve obj type, look up method return
+        # Case 2a: for x in obj.method() -- resolve obj type, look up method return
         if isinstance(it, ast.Call):
             callee = _name_from_node(it.func)
             if callee and "." in callee:
@@ -1054,6 +1186,14 @@ class _TypeInferencer:
                         if inner:
                             return inner
 
+            # Case 2b: for x in fn() -- standalone function with Generator[X] return
+            if callee:
+                ret_ann = self._lookup_return_type(callee, func_qname)
+                if ret_ann:
+                    inner = self._resolve_subscript_inner(ret_ann)
+                    if inner:
+                        return inner
+
         # Case 3: for x in obj.values() on dict[K, V]
         if isinstance(it, ast.Call) and isinstance(it.func, ast.Attribute):
             if it.func.attr == "values":
@@ -1065,6 +1205,75 @@ class _TypeInferencer:
                             sl = ann.slice
                             if isinstance(sl, ast.Tuple) and len(sl.elts) >= 2:
                                 return self._resolve_annotation(sl.elts[-1])
+
+        return None
+
+    def _lookup_return_type(self, callee: str, caller_qname: str) -> ast.AST | None:
+        """Look up a function's return type annotation by name.
+
+        Handles bare names (suffix match), qualified names (direct), and
+        Class.method patterns (via type resolution).
+        """
+        # Direct qualified name match
+        ret = self._return_types.get(callee)
+        if ret:
+            return ret
+
+        # Dotted: Class.method or obj.method
+        if "." in callee:
+            obj_name, method = callee.rsplit(".", 1)
+            cls = self._resolve_var_type(obj_name, caller_qname)
+            if not cls:
+                cls = self._type_index.get(obj_name)
+            if cls:
+                ret = self._return_types.get(f"{cls}.{method}")
+                if ret:
+                    return ret
+
+        # Bare name: suffix match against _return_types keys
+        suffix = "." + callee
+        for qname, ann in self._return_types.items():
+            if qname == callee or qname.endswith(suffix):
+                return ann
+
+        return None
+
+    def _infer_context_manager_type(
+        self,
+        ctx_expr: ast.AST,
+        func_qname: str,
+        is_async: bool,
+        local_annotations: dict[str, ast.AST],
+        param_annotations: dict[str, ast.AST],
+    ) -> str | None:
+        """Infer the type of the `as` variable in a with/async-with statement.
+
+        `with X() as var` -> var's type is X.__enter__ return annotation.
+        `async with X() as var` -> X.__aenter__ return annotation.
+        `with expr as var` where expr is a typed local -> same logic.
+        """
+        enter_method = "__aenter__" if is_async else "__enter__"
+
+        # Determine the context manager's class
+        cm_class: str | None = None
+
+        if isinstance(ctx_expr, ast.Call):
+            # `with SyncPool() as conn` or `with SyncPool(...) as conn`
+            callee = _name_from_node(ctx_expr.func)
+            if callee:
+                cm_class = self._type_index.get(callee)
+        elif isinstance(ctx_expr, ast.Name):
+            # `with pool as conn` where pool is a typed variable
+            cm_class = self._resolve_var_type(ctx_expr.id, func_qname)
+
+        if not cm_class:
+            return None
+
+        # Look up __enter__/__aenter__ return annotation on the CM class
+        enter_qname = f"{cm_class}.{enter_method}"
+        ret_ann = self._return_types.get(enter_qname)
+        if ret_ann:
+            return self._resolve_annotation(ret_ann)
 
         return None
 

@@ -144,22 +144,23 @@ class CodeGraph:
 
         # Step 3: Build name index from ALL current nodes for edge resolution
         all_nodes = self.all_nodes(include_proposed=False)
-        name_index: dict[str, list[str]] = {}
+        name_index: dict[str, set[str]] = {}
         for n in all_nodes:
-            name_index.setdefault(n.name, []).append(n.id)
+            name_index.setdefault(n.name, set()).add(n.id)
             parts = n.qualified_name.split(".")
             for i in range(1, len(parts)):
                 suffix = ".".join(parts[i:])
-                name_index.setdefault(suffix, []).append(n.id)
+                name_index.setdefault(suffix, set()).add(n.id)
 
         node_ids = {n.id for n in all_nodes}
 
-        # Step 4: Resolve and add new edges
+        # Step 4: Resolve and add new edges (skip external references)
         added_edges: list[EdgeData] = []
         for e in new_edges:
             resolved = self._resolve_edge(e, node_ids, name_index)
-            self.add_edge(resolved)
-            added_edges.append(resolved)
+            if resolved.source in node_ids and resolved.target in node_ids:
+                self.add_edge(resolved)
+                added_edges.append(resolved)
 
         return {
             "removed_nodes": removed["removed_nodes"],
@@ -174,51 +175,70 @@ class CodeGraph:
         for n in nodes:
             self.add_node(n)
 
-        # Build a lookup: short name -> list of qualified IDs
-        name_index: dict[str, list[str]] = {}
+        # Build a lookup: short name -> set of qualified IDs
+        # Sets prevent duplicates from suffix indexing (which caused
+        # _resolve_edge to see len>1 for single-node names and bail).
+        name_index: dict[str, set[str]] = {}
         for n in nodes:
-            name_index.setdefault(n.name, []).append(n.id)
+            name_index.setdefault(n.name, set()).add(n.id)
             # Also index by qualified_name suffix fragments
             # e.g. "graph.CodeGraph" for "analyzer.graph.CodeGraph"
             parts = n.qualified_name.split(".")
             for i in range(1, len(parts)):
                 suffix = ".".join(parts[i:])
-                name_index.setdefault(suffix, []).append(n.id)
+                name_index.setdefault(suffix, set()).add(n.id)
 
         node_ids = {n.id for n in nodes}
 
         for e in edges:
             resolved = self._resolve_edge(e, node_ids, name_index)
+            # Source must be a known project node. Targets may be
+            # unresolved for CALLS/READS (inference gaps on untyped
+            # variables), but structural edges need both endpoints.
+            if resolved.source not in node_ids:
+                continue
             self.add_edge(resolved)
 
     @staticmethod
     def _resolve_edge(
         edge: EdgeData,
         node_ids: set[str],
-        name_index: dict[str, list[str]],
+        name_index: dict[str, set[str]],
     ) -> EdgeData:
         """Try to resolve unqualified source/target names to known node IDs."""
         source = edge.source
         target = edge.target
 
         if source not in node_ids:
-            candidates = name_index.get(source, [])
+            candidates = name_index.get(source, set())
             if len(candidates) == 1:
-                source = candidates[0]
+                source = next(iter(candidates))
 
         if target not in node_ids:
-            candidates = name_index.get(target, [])
+            candidates = name_index.get(target, set())
             if len(candidates) == 1:
-                target = candidates[0]
+                target = next(iter(candidates))
             elif len(candidates) > 1:
-                # Prefer a candidate in the same module as the source
-                src_module = source.rsplit(".", 1)[0] if "." in source else source
-                for c in candidates:
-                    if c.startswith(src_module):
-                        target = c
-                        break
-                else:
-                    target = candidates[0]
+                # For CALLS edges, a bare name like `process()` in Python
+                # NEVER resolves to the same class — you need `self.process()`
+                # for that.  Exclude the source itself to prevent self-call
+                # artifacts, and prefer module-level over class-level.
+                filtered = candidates - {source}
+                if not filtered:
+                    filtered = candidates
+
+                # Extract the top-level module from the source
+                src_parts = source.split(".")
+                src_module = src_parts[0] if src_parts else source
+
+                # Score candidates: prefer same module, then shorter paths
+                # (module-level functions are shorter than class methods)
+                best = None
+                for c in filtered:
+                    if c.startswith(src_module + "."):
+                        if best is None or c.count(".") < best.count("."):
+                            best = c
+                target = best or next(iter(filtered))
 
         if source == edge.source and target == edge.target:
             return edge

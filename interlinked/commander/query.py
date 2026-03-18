@@ -243,11 +243,15 @@ class QueryEngine:
 
         if expr.startswith("callers of"):
             target = expression.split("callers of", 1)[1].strip()
-            results = self.graph.callers_of(target)
+            node = self._resolve_node(target)
+            if node:
+                results = self.graph.callers_of(node.id)
 
         elif expr.startswith("callees of"):
             target = expression.split("callees of", 1)[1].strip()
-            results = self.graph.callees_of(target)
+            node = self._resolve_node(target)
+            if node:
+                results = self.graph.callees_of(node.id)
 
         elif expr.startswith("parameters of") or expr.startswith("params of"):
             target = expression.split("of", 1)[1].strip()
