@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "interlinked-mapper"
-version = "0.1.9"
+version = "0.2.0"
 description = "A Python program topology explorer — visualize the shape of your codebase"
 readme = "README.md"
 license = {text = "MIT"}

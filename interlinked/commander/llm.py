@@ -62,12 +62,16 @@ You control what they see by emitting Python commands against the `view` object.
 
 ### Queries
 - `view.query("dead functions")` — Find dead/uncalled code (highlights results)
+- `view.query("dead functions in <scope>")` — Dead functions scoped to a module prefix, e.g. `"dead functions in engine.rules.ir_exec"`
+- `view.query("dead classes in <scope>")` — Dead classes in a scope
 - `view.query("callers of <name>")` — Who calls this?
 - `view.query("callees of <name>")` — What does this call?
 - `view.query("parameters of <name>")` — Show function parameters
 - `view.query("returns of <name>")` — Show what a function returns (project symbols)
 - `view.query("external calls in <name>")` — Show external library calls from a module/class/function
 - `view.query("external calls")` — All external calls in the project
+- `view.query("functions in <scope>")` — List all functions/methods under a module prefix, e.g. `"functions in engine.rules"`
+- `view.query("classes in <scope>")` — List all classes under a module prefix
 - `view.query("modules")` / `view.query("classes")` / `view.query("functions")` / `view.query("parameters")` / `view.query("variables")`
 - `view.query("<search_term>")` — Fuzzy name search
 
@@ -81,6 +85,19 @@ You control what they see by emitting Python commands against the `view` object.
 - `view.depends_on(name)` — **Upstream dependencies**: highlight everything this symbol depends on.
 - `view.path_between(source, target)` — Shortest dependency chain between two symbols.
 - `view.all_paths(source, target, max_depth=8)` — Every route between two symbols.
+
+### Cross-Module Edge Enumeration
+- `view.edges_between(source_scope, target_scope=None, edge_types=None)` — List all edges leaving a module scope, grouped by target module. Essential for module isolation checks.
+  - `view.edges_between("engine.rules.resolver")` — ALL outgoing edges from resolver
+  - `view.edges_between("engine.rules.resolver", target_scope="engine.systems")` — Only edges going to engine.systems
+  - `view.edges_between("engine.rules", edge_types=["imports"])` — Only import edges
+  - `view.edges_between("engine.rules", edge_types=["calls", "imports"])` — Calls + imports
+
+### Reachability (Purity / Isolation Checks)
+- `view.reachable(source, target, edge_types=None, max_depth=20)` — Check if target is reachable from source via specific edge types. Default: follows only call edges.
+  - `view.reachable("resolve_effects", "world.set_component")` — Is there ANY call path? Returns path if yes.
+  - `view.reachable("resolver.resolve", "db.commit", edge_types=["calls", "imports"])` — Check calls + imports
+  - Returns JSON: `{{"reachable": true/false, "path": [...], "short_path": "A → B → C"}}`
 
 ### Architecture Health
 - `view.find_cycles()` — Find and highlight circular dependencies (calls/imports).

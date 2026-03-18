@@ -251,6 +251,25 @@ def create_app(graph: CodeGraph, initial_path: str | None = None) -> FastAPI:
         result = engine.reset_filter()
         return JSONResponse({"result": result})
 
+    @app.post("/api/edges_between")
+    async def edges_between(body: dict) -> JSONResponse:
+        result = engine.edges_between(
+            source_scope=body.get("source_scope", ""),
+            target_scope=body.get("target_scope"),
+            edge_types=body.get("edge_types"),
+        )
+        return JSONResponse(content=json.loads(result))
+
+    @app.post("/api/reachable")
+    async def reachable(body: dict) -> JSONResponse:
+        result = engine.reachable(
+            source=body.get("source", ""),
+            target=body.get("target", ""),
+            edge_types=body.get("edge_types"),
+            max_depth=body.get("max_depth", 20),
+        )
+        return JSONResponse(content=json.loads(result))
+
     @app.post("/api/trace_variable")
     async def trace_variable(body: dict) -> JSONResponse:
         var_name = body.get("variable", "")

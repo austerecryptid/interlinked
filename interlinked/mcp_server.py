@@ -141,7 +141,7 @@ def create_mcp_server(project_path: str) -> Server:
             ),
             Tool(
                 name="interlinked_query",
-                description="Run a structured query against the codebase graph. Supports: 'dead functions', 'callers of X', 'callees of X', 'modules', 'classes', 'functions', or any search term for fuzzy name matching.",
+                description="Run a structured query against the codebase graph. Supports: 'callers of X', 'callees of X', 'dead functions', 'dead functions in <scope>', 'functions in <scope>', 'classes in <scope>', 'modules in <scope>', 'external calls in <scope>', 'imports of X', 'functions returning <type>', or any search term for fuzzy name matching. The 'in <scope>' suffix filters by qualified name prefix.",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -234,6 +234,33 @@ def create_mcp_server(project_path: str) -> Server:
                 },
             ),
             Tool(
+                name="interlinked_edges_between",
+                description="List all edges (calls, imports, etc.) from one module scope to another, or to everything outside the scope. Returns edges grouped by target module. Essential for module isolation checks.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "source_scope": {"type": "string", "description": "Qualified name prefix of source, e.g. 'engine.rules.resolver'"},
+                        "target_scope": {"type": "string", "description": "Optional: qualified name prefix of target to filter to, e.g. 'engine.systems'. Omit to see ALL outgoing edges."},
+                        "edge_types": {"type": "array", "items": {"type": "string"}, "description": "Optional: edge types to include (calls, imports, inherits, reads, writes). Default: all."},
+                    },
+                    "required": ["source_scope"],
+                },
+            ),
+            Tool(
+                name="interlinked_reachable",
+                description="Check if there is any path from source to target following specific edge types (default: calls only). Use for purity contracts and isolation verification. Returns the shortest path if reachable.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "source": {"type": "string", "description": "Qualified name of the source symbol"},
+                        "target": {"type": "string", "description": "Qualified name (or partial) of the target symbol"},
+                        "edge_types": {"type": "array", "items": {"type": "string"}, "description": "Edge types to traverse (default: ['calls'])"},
+                        "max_depth": {"type": "integer", "description": "Maximum path length (default: 20)", "default": 20},
+                    },
+                    "required": ["source", "target"],
+                },
+            ),
+            Tool(
                 name="interlinked_reset",
                 description="Reset all filters, focus, and highlights back to the default full-graph view.",
                 inputSchema={"type": "object", "properties": {}, "required": []},
@@ -320,6 +347,17 @@ def _dispatch_via_server(name: str, args: dict[str, Any], server_url: str) -> st
         "interlinked_get_context": ("POST", "/api/get_context", {"target": args.get("target", "")}),
         "interlinked_command":     ("POST", "/api/command", {"command": args.get("command", "")}),
         "interlinked_switch_project": ("POST", "/api/switch_project", {"path": args.get("path", "")}),
+        "interlinked_edges_between": ("POST", "/api/edges_between", {
+            "source_scope": args.get("source_scope", ""),
+            "target_scope": args.get("target_scope"),
+            "edge_types": args.get("edge_types"),
+        }),
+        "interlinked_reachable":   ("POST", "/api/reachable", {
+            "source": args.get("source", ""),
+            "target": args.get("target", ""),
+            "edge_types": args.get("edge_types"),
+            "max_depth": args.get("max_depth", 20),
+        }),
         "interlinked_reset":       ("POST", "/api/reset", {}),
     }
 
@@ -423,6 +461,21 @@ def _dispatch_tool(
         result = _rebuild_graph(args["path"], graph)
         engine.reset_filter()
         return json.dumps(result, indent=2)
+
+    elif name == "interlinked_edges_between":
+        return engine.edges_between(
+            source_scope=args["source_scope"],
+            target_scope=args.get("target_scope"),
+            edge_types=args.get("edge_types"),
+        )
+
+    elif name == "interlinked_reachable":
+        return engine.reachable(
+            source=args["source"],
+            target=args["target"],
+            edge_types=args.get("edge_types"),
+            max_depth=args.get("max_depth", 20),
+        )
 
     elif name == "interlinked_reset":
         return engine.reset_filter()

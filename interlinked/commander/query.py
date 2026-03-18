@@ -305,9 +305,26 @@ class QueryEngine:
             results = self.graph.functions_returning(type_hint)
 
         elif "dead" in expr or "uncalled" in expr:
+            # Support scoped dead queries: "dead functions in engine.rules"
+            scope = None
+            scope_match = re.search(r'(?:dead|uncalled)\s+\w+\s+in\s+(\S+)', expression, re.IGNORECASE)
+            if scope_match:
+                scope = scope_match.group(1)
+            # Support type filter: "dead functions" vs "dead classes" vs just "dead"
+            type_filter: set[SymbolType] | None = None
+            if "function" in expr or "method" in expr:
+                type_filter = {SymbolType.FUNCTION, SymbolType.METHOD}
+            elif "class" in expr:
+                type_filter = {SymbolType.CLASS}
+            elif "module" in expr:
+                type_filter = {SymbolType.MODULE}
+            elif "variable" in expr:
+                type_filter = {SymbolType.VARIABLE}
             results = [
                 n for n in self.graph.all_nodes()
                 if n.is_dead
+                and (type_filter is None or n.symbol_type in type_filter)
+                and (scope is None or n.qualified_name.startswith(scope))
             ]
 
         elif expr.startswith("imports of"):
@@ -316,22 +333,34 @@ class QueryEngine:
             return [e.model_dump() for e in edges]
 
         elif expr.startswith("modules"):
+            scope = self._parse_scope(expression, "modules")
             results = self.graph.nodes_by_type(SymbolType.MODULE)
+            if scope:
+                results = [n for n in results if n.qualified_name.startswith(scope)]
 
         elif expr.startswith("classes"):
+            scope = self._parse_scope(expression, "classes")
             results = self.graph.nodes_by_type(SymbolType.CLASS)
+            if scope:
+                results = [n for n in results if n.qualified_name.startswith(scope)]
 
         elif expr.startswith("functions") or expr.startswith("methods"):
+            scope = self._parse_scope(expression, "functions") or self._parse_scope(expression, "methods")
             results = (
                 self.graph.nodes_by_type(SymbolType.FUNCTION)
                 + self.graph.nodes_by_type(SymbolType.METHOD)
             )
+            if scope:
+                results = [n for n in results if n.qualified_name.startswith(scope)]
 
         elif expr.startswith("parameters") or expr.startswith("variables"):
+            scope = self._parse_scope(expression, "parameters") or self._parse_scope(expression, "variables")
             results = [
                 n for n in self.graph.all_nodes()
                 if n.symbol_type == (SymbolType.PARAMETER if "param" in expr else SymbolType.VARIABLE)
             ]
+            if scope:
+                results = [n for n in results if n.qualified_name.startswith(scope)]
 
         else:
             # Fuzzy name search
@@ -652,6 +681,11 @@ class QueryEngine:
 
     # ── Helper ───────────────────────────────────────────────────────
 
+    def _parse_scope(self, expression: str, keyword: str) -> str | None:
+        """Extract scope from 'keyword in scope' pattern, e.g. 'functions in engine.rules'."""
+        m = re.search(rf'{keyword}\s+in\s+(\S+)', expression, re.IGNORECASE)
+        return m.group(1) if m else None
+
     def _resolve_node(self, name: str) -> NodeData | None:
         """Resolve a name to a node, with fuzzy matching."""
         node = self.graph.get_node(name)
@@ -775,6 +809,154 @@ class QueryEngine:
 
         context = get_rich_context(self.graph, node)
         return json.dumps(context, indent=2, default=str)
+
+    # ── Cross-module edge enumeration ────────────────────────────────
+
+    def edges_between(
+        self,
+        source_scope: str,
+        target_scope: str | None = None,
+        edge_types: list[str] | None = None,
+    ) -> str:
+        """List all edges from one module scope to another (or to everything external).
+
+        Args:
+            source_scope: Qualified name prefix of the source module, e.g. "engine.rules.resolver".
+            target_scope: Optional target prefix. If omitted, shows all edges leaving source_scope.
+            edge_types: Optional filter, e.g. ["calls", "imports"]. Default: all types.
+
+        Returns JSON with edges grouped by target module.
+        """
+        et_filter = None
+        if edge_types:
+            et_filter = set()
+            for et_str in edge_types:
+                try:
+                    et_filter.add(EdgeType(et_str))
+                except ValueError:
+                    pass
+
+        all_edges = self.graph.all_edges(include_proposed=False)
+        source_nodes = {n.id for n in self.graph.all_nodes() if n.qualified_name.startswith(source_scope)}
+
+        edges_out: list[dict] = []
+        for e in all_edges:
+            if e.source not in source_nodes:
+                continue
+            if et_filter and e.edge_type not in et_filter:
+                continue
+            # Skip edges within the source scope (internal)
+            target_node = self.graph.get_node(e.target)
+            target_qname = target_node.qualified_name if target_node else e.target
+            if target_qname.startswith(source_scope):
+                continue
+            # If target_scope specified, filter to it
+            if target_scope and not target_qname.startswith(target_scope):
+                continue
+            edges_out.append({
+                "source": e.source,
+                "target": e.target,
+                "edge_type": e.edge_type.value,
+                "line": e.line,
+            })
+
+        # Group by target module (first two dotted components of target)
+        by_module: dict[str, list[dict]] = {}
+        for edge in edges_out:
+            tgt = edge["target"]
+            parts = tgt.split(".")
+            mod = ".".join(parts[:2]) if len(parts) > 1 else parts[0]
+            by_module.setdefault(mod, []).append(edge)
+
+        result = {
+            "source_scope": source_scope,
+            "target_scope": target_scope or "(all external)",
+            "total_edges": len(edges_out),
+            "by_target_module": {
+                mod: {"count": len(edges), "edges": edges}
+                for mod, edges in sorted(by_module.items(), key=lambda x: -len(x[1]))
+            },
+        }
+
+        # Highlight source nodes in view
+        self.state.highlighted_node_ids = list({e["source"] for e in edges_out})
+        self._notify()
+
+        return json.dumps(result, indent=2)
+
+    # ── Reachability ─────────────────────────────────────────────────
+
+    def reachable(
+        self,
+        source: str,
+        target: str,
+        edge_types: list[str] | None = None,
+        max_depth: int = 20,
+    ) -> str:
+        """Check if target is reachable from source via specific edge types.
+
+        By default follows only 'calls' edges — use for purity/isolation checks.
+        Returns the shortest path if reachable, or a clear "not reachable" message.
+
+        Args:
+            source: Qualified name of the source symbol.
+            target: Qualified name (or partial) of the target symbol.
+            edge_types: Edge types to traverse (default: ["calls"]).
+            max_depth: Maximum path length to search.
+        """
+        import networkx as nx
+
+        src_node = self._resolve_node(source)
+        tgt_node = self._resolve_node(target)
+        if not src_node:
+            return json.dumps({"reachable": False, "error": f"Source '{source}' not found."})
+        if not tgt_node:
+            return json.dumps({"reachable": False, "error": f"Target '{target}' not found."})
+
+        # Build edge-type-filtered subgraph
+        et_filter = set()
+        for et_str in (edge_types or ["calls"]):
+            try:
+                et_filter.add(EdgeType(et_str).value)
+            except ValueError:
+                pass
+        if not et_filter:
+            et_filter = {"calls"}
+
+        sub_edges = [
+            (u, v) for u, v, d in self.graph._g.edges(data=True)
+            if d.get("edge_type") in et_filter
+        ]
+        sub_g = nx.DiGraph()
+        sub_g.add_edges_from(sub_edges)
+
+        try:
+            path = nx.shortest_path(sub_g, src_node.id, tgt_node.id)
+            if len(path) - 1 > max_depth:
+                return json.dumps({"reachable": False, "reason": f"Path exists but exceeds max_depth={max_depth}."})
+
+            # Highlight the path
+            self.state.highlighted_node_ids = list(path)
+            self.state.trace_node_roles = {path[0]: "origin", path[-1]: "destination"}
+            for nid in path[1:-1]:
+                self.state.trace_node_roles[nid] = "passthrough"
+            self.state.trace_edge_roles = {}
+            self._notify()
+
+            short_path = " → ".join(n.split(".")[-1] for n in path)
+            return json.dumps({
+                "reachable": True,
+                "path_length": len(path) - 1,
+                "path": list(path),
+                "short_path": short_path,
+            }, indent=2)
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            return json.dumps({
+                "reachable": False,
+                "source": src_node.qualified_name,
+                "target": tgt_node.qualified_name,
+                "edge_types": list(et_filter),
+            })
 
     # ── Display settings ─────────────────────────────────────────────
 
