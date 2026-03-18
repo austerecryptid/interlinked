@@ -563,10 +563,7 @@ def _dispatch_via_server(name: str, args: dict[str, Any], server_url: str) -> st
                 return json.dumps(result, indent=2)
             return str(result)
         if "results" in data:
-            results = data["results"]
-            if len(results) > 20:
-                return f"Found {len(results)} results. Showing first 20:\n" + json.dumps(results[:20], indent=2)
-            return json.dumps(results, indent=2)
+            return json.dumps(data["results"], indent=2)
         if "error" in data:
             return f"Error: {data['error']}"
         return json.dumps(data, indent=2)
@@ -654,10 +651,7 @@ async def _async_dispatch_via_server(name: str, args: dict[str, Any], server_url
                 return json.dumps(result, indent=2)
             return str(result)
         if "results" in data:
-            results = data["results"]
-            if len(results) > 20:
-                return f"Found {len(results)} results. Showing first 20:\n" + json.dumps(results[:20], indent=2)
-            return json.dumps(results, indent=2)
+            return json.dumps(data["results"], indent=2)
         if "error" in data:
             return f"Error: {data['error']}"
         return json.dumps(data, indent=2)
@@ -692,9 +686,6 @@ def _dispatch_tool(
 
     elif name == "interlinked_query":
         results = engine.query(args["expression"])
-        if len(results) > 20:
-            summary = f"Found {len(results)} results. Showing first 20:\n"
-            return summary + json.dumps(results[:20], indent=2)
         return json.dumps(results, indent=2)
 
     elif name == "interlinked_trace_variable":

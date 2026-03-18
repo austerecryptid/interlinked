@@ -254,8 +254,8 @@ def get_rich_context(graph: CodeGraph, node: NodeData) -> dict:
     # Connections
     callers = graph.callers_of(node.id)
     callees = graph.callees_of(node.id)
-    context["callers"] = [{"id": n.id, "name": n.name} for n in callers[:20]]
-    context["callees"] = [{"id": n.id, "name": n.name} for n in callees[:20]]
+    context["callers"] = [{"id": n.id, "name": n.name} for n in callers]
+    context["callees"] = [{"id": n.id, "name": n.name} for n in callees]
 
     # Fingerprint — slim version (drop ast_tree, minhash, ast_node_counts)
     fp = node.metadata.get("fingerprint")
