@@ -42,3 +42,4 @@ interlinked/visualizer/frontend/dist/
 # Misc
 *.log
 .env
+interlinked/.interlinked/embeddings.db

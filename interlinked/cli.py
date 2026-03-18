@@ -32,7 +32,7 @@ def main() -> None:
 
     # ── mcp ───────────────────────────────────────────────────────
     mcp_p = sub.add_parser("mcp", help="Run as an MCP server (stdio transport) for Windsurf/Claude Desktop")
-    mcp_p.add_argument("path", type=str, help="Path to the Python project root")
+    mcp_p.add_argument("path", type=str, nargs="?", default=".", help="Path to the Python project root (default: current directory)")
 
     args = parser.parse_args()
 
