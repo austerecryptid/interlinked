@@ -12,6 +12,27 @@ from interlinked.models import (
 )
 
 
+# Method names so common on builtins (dict, list, set, str, etc.) that resolving
+# them to project symbols by bare-name matching is almost always a false positive.
+# e.g. `op_dict.items()` should NOT resolve to `ActionCost.items`.
+_BUILTIN_METHOD_NAMES: frozenset[str] = frozenset({
+    # dict
+    "items", "keys", "values", "get", "pop", "update", "setdefault",
+    "clear", "copy",
+    # list / sequence
+    "append", "extend", "insert", "remove", "sort", "reverse",
+    "count", "index",
+    # set
+    "add", "discard", "union", "intersection", "difference",
+    "issubset", "issuperset",
+    # str
+    "strip", "split", "join", "replace", "startswith", "endswith",
+    "lower", "upper", "format", "encode", "decode",
+    # general
+    "close", "read", "write", "flush", "seek", "tell",
+})
+
+
 class CodeGraph:
     """The core graph structure representing an entire Python project.
 
@@ -215,6 +236,12 @@ class CodeGraph:
                 source = next(iter(candidates))
 
         if target not in node_ids:
+            # Never resolve bare builtin method names — they match too
+            # broadly (e.g. "items" matching ActionCost.items when the
+            # actual call is dict.items()).
+            if target in _BUILTIN_METHOD_NAMES:
+                return edge
+
             candidates = name_index.get(target, set())
             if len(candidates) == 1:
                 target = next(iter(candidates))
