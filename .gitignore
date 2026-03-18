@@ -10,7 +10,7 @@ __pycache__/
 *.so
 *.egg-info/
 *.egg
-dist/
+/dist/
 build/
 *.whl
 
@@ -37,7 +37,7 @@ htmlcov/
 
 # Frontend
 interlinked/visualizer/frontend/node_modules/
-interlinked/visualizer/frontend/dist/
+!interlinked/visualizer/frontend/dist/
 
 # Misc
 *.log
