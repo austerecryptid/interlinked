@@ -24,6 +24,10 @@ class CodeGraph:
         self._node_data: dict[str, NodeData] = {}
         self._proposed_nodes: dict[str, NodeData] = {}
         self._proposed_edges: list[EdgeData] = []
+        # Edge indexes for fast filtered lookups
+        self._edges_by_source: dict[str, list[EdgeData]] = {}
+        self._edges_by_target: dict[str, list[EdgeData]] = {}
+        self._edge_set: set[tuple[str, str, str]] = set()  # (src, tgt, type) dedup
 
     # ── Construction ─────────────────────────────────────────────────
 
@@ -40,9 +44,133 @@ class CodeGraph:
             key=edge.edge_type.value,
             **edge.model_dump(),
         )
+        # Maintain edge indexes
+        dedup_key = (edge.source, edge.target, edge.edge_type.value)
+        if dedup_key not in self._edge_set:
+            self._edge_set.add(dedup_key)
+            self._edges_by_source.setdefault(edge.source, []).append(edge)
+            self._edges_by_target.setdefault(edge.target, []).append(edge)
+
+    def _clear(self) -> None:
+        """Clear all graph state for a full rebuild."""
+        self._g.clear()
+        self._node_data.clear()
+        self._proposed_nodes.clear()
+        self._proposed_edges.clear()
+        self._edges_by_source.clear()
+        self._edges_by_target.clear()
+        self._edge_set.clear()
+
+    def _remove_edge(self, edge: EdgeData) -> None:
+        """Remove an edge from the graph and all indexes."""
+        dedup_key = (edge.source, edge.target, edge.edge_type.value)
+        self._edge_set.discard(dedup_key)
+        # Remove from source index
+        src_list = self._edges_by_source.get(edge.source)
+        if src_list:
+            self._edges_by_source[edge.source] = [
+                e for e in src_list
+                if not (e.source == edge.source and e.target == edge.target and e.edge_type == edge.edge_type)
+            ]
+        # Remove from target index
+        tgt_list = self._edges_by_target.get(edge.target)
+        if tgt_list:
+            self._edges_by_target[edge.target] = [
+                e for e in tgt_list
+                if not (e.source == edge.source and e.target == edge.target and e.edge_type == edge.edge_type)
+            ]
+        # Remove from NetworkX
+        if self._g.has_edge(edge.source, edge.target, key=edge.edge_type.value):
+            self._g.remove_edge(edge.source, edge.target, key=edge.edge_type.value)
+
+    def remove_file(self, module_qname: str) -> dict[str, list]:
+        """Remove all nodes and edges belonging to a module. Returns removed IDs.
+
+        This removes:
+        - All nodes whose qualified_name starts with module_qname
+        - All edges sourced from or targeting those nodes
+        - All edges sourced from or targeting module_qname itself
+        """
+        prefix = module_qname + "."
+        removed_node_ids: list[str] = []
+        removed_edges: list[EdgeData] = []
+
+        # Find nodes to remove
+        to_remove = [
+            nid for nid in self._node_data
+            if nid == module_qname or nid.startswith(prefix)
+        ]
+        removed_ids_set = set(to_remove)
+
+        # Find edges to remove (any edge touching a removed node)
+        for nid in to_remove:
+            for e in list(self._edges_by_source.get(nid, [])):
+                removed_edges.append(e)
+                self._remove_edge(e)
+            for e in list(self._edges_by_target.get(nid, [])):
+                if (e.source, e.target, e.edge_type.value) in self._edge_set:
+                    removed_edges.append(e)
+                    self._remove_edge(e)
+
+        # Remove nodes
+        for nid in to_remove:
+            del self._node_data[nid]
+            if nid in self._g:
+                self._g.remove_node(nid)
+            removed_node_ids.append(nid)
+
+        return {"removed_nodes": removed_node_ids, "removed_edges": removed_edges}
+
+    def update_file(
+        self,
+        module_qname: str,
+        new_nodes: list[NodeData],
+        new_edges: list[EdgeData],
+    ) -> dict[str, list]:
+        """Incrementally update the graph for a single changed file.
+
+        1. Remove all old nodes/edges for this module
+        2. Add new nodes/edges
+        3. Resolve new edges using the full name index
+
+        Returns a delta dict with added/removed node IDs.
+        """
+        # Step 1: Remove old data for this module
+        removed = self.remove_file(module_qname)
+
+        # Step 2: Add new nodes
+        for n in new_nodes:
+            self.add_node(n)
+
+        # Step 3: Build name index from ALL current nodes for edge resolution
+        all_nodes = self.all_nodes(include_proposed=False)
+        name_index: dict[str, list[str]] = {}
+        for n in all_nodes:
+            name_index.setdefault(n.name, []).append(n.id)
+            parts = n.qualified_name.split(".")
+            for i in range(1, len(parts)):
+                suffix = ".".join(parts[i:])
+                name_index.setdefault(suffix, []).append(n.id)
+
+        node_ids = {n.id for n in all_nodes}
+
+        # Step 4: Resolve and add new edges
+        added_edges: list[EdgeData] = []
+        for e in new_edges:
+            resolved = self._resolve_edge(e, node_ids, name_index)
+            self.add_edge(resolved)
+            added_edges.append(resolved)
+
+        return {
+            "removed_nodes": removed["removed_nodes"],
+            "added_nodes": [n.id for n in new_nodes],
+            "removed_edges": removed["removed_edges"],
+            "added_edges": added_edges,
+        }
 
     def build_from(self, nodes: list[NodeData], edges: list[EdgeData]) -> None:
         """Populate from parser output, resolving short names to qualified IDs."""
+        self._clear()
         for n in nodes:
             self.add_node(n)
 
@@ -723,10 +851,16 @@ class CodeGraph:
                 if new_key not in remapped_edge_roles or role == "write":
                     remapped_edge_roles[new_key] = role
 
+            # If trace was active but no roles survived remapping (e.g. traced
+            # symbols don't exist inside any class at class-zoom), preserve the
+            # original roles so the frontend legend still shows trace sections.
+            final_node_roles = remapped_node_roles if remapped_node_roles else view.trace_node_roles
+            final_edge_roles = remapped_edge_roles if remapped_edge_roles else view.trace_edge_roles
+
             view = view.model_copy(update={
                 "highlighted_node_ids": list(remapped),
-                "trace_node_roles": remapped_node_roles,
-                "trace_edge_roles": remapped_edge_roles,
+                "trace_node_roles": final_node_roles,
+                "trace_edge_roles": final_edge_roles,
             })
 
         return GraphSnapshot(nodes=nodes, edges=edges, view=view)
@@ -789,15 +923,50 @@ class CodeGraph:
         return None
 
     def _filter_edges(self, view: ViewState, node_ids: set[str]) -> list[EdgeData]:
-        all_edges = self.all_edges(include_proposed=view.show_proposed)
+        # Use edge index: only scan edges originating from or targeting visible nodes
+        # This is O(V * avg_degree) instead of O(E) — critical for 200k+ edge graphs
+        visible_etypes = set(view.visible_edge_types)
 
-        if not view.show_dead:
-            all_edges = [e for e in all_edges if not e.is_dead]
+        # Collect candidate edges from the index (edges touching visible nodes)
+        # We also need edges from non-visible nodes that aggregate UP to visible ancestors
+        candidate_edges: list[EdgeData] = []
+        seen_sources: set[str] = set()
 
-        # At coarser zoom levels, aggregate edges up to visible ancestors
+        # Edges from visible nodes
+        for nid in node_ids:
+            for e in self._edges_by_source.get(nid, []):
+                if not view.show_proposed and e.is_proposed:
+                    continue
+                if not view.show_dead and e.is_dead:
+                    continue
+                candidate_edges.append(e)
+            seen_sources.add(nid)
+
+        # For coarser zoom levels, we also need edges from descendant nodes
+        # that aggregate up to visible ancestors. Collect edges from all nodes
+        # that have a visible ancestor (i.e., nodes whose qualified_name starts
+        # with a visible node's qualified_name).
+        # We use the _edges_by_source index keyed on all source nodes.
+        if view.zoom_level in ("module", "class"):
+            # Build prefix set for fast startswith checks
+            prefixes = sorted(node_ids)
+            for src_id in self._edges_by_source:
+                if src_id in seen_sources:
+                    continue
+                # Check if this source has a visible ancestor
+                ancestor = self._ancestor_at_zoom(src_id, node_ids)
+                if ancestor:
+                    for e in self._edges_by_source[src_id]:
+                        if not view.show_proposed and e.is_proposed:
+                            continue
+                        if not view.show_dead and e.is_dead:
+                            continue
+                        candidate_edges.append(e)
+
+        # Aggregate edges up to visible ancestors (dedup by src+tgt+type)
         aggregated: dict[tuple[str, str, str], EdgeData] = {}
-        for e in all_edges:
-            if e.edge_type not in view.visible_edge_types:
+        for e in candidate_edges:
+            if e.edge_type not in visible_etypes:
                 continue
             # Skip containment edges at module/class zoom — they're implicit
             if e.edge_type == EdgeType.CONTAINS:

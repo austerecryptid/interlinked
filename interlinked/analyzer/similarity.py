@@ -1,13 +1,10 @@
 """Similarity analysis — structural fingerprinting and duplicate detection.
 
-Uses NetworkX graph algorithms (Jaccard coefficient on neighbor sets) combined
-with AST structural features to detect similar/duplicate code.
-
-Detects:
-- Functions/methods with similar call patterns (Jaccard on callees)
-- Similar read/write patterns (Jaccard on data-flow neighbors)
-- Similar structural shape (AST node type distribution, nesting depth, control flow)
-- Potential duplicated logic paths
+Three tiers of comparison:
+1. Minhash pre-filter — O(n) LSH to avoid O(n²) pairwise comparison
+2. Classical structural scoring — Tree Edit Distance on ASTs, WL graph kernel
+   on call neighborhoods, Jaccard on data-flow, control flow pattern matching
+3. Embedding similarity (optional) — Type 4 semantic detection via local code model
 
 Clustering uses nx.connected_components on a similarity threshold graph.
 """
@@ -15,16 +12,21 @@ Clustering uses nx.connected_components on a similarity threshold graph.
 from __future__ import annotations
 
 import ast
+import hashlib
 import math
+import struct
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 import networkx as nx
 
 from interlinked.analyzer.graph import CodeGraph
 from interlinked.models import NodeData, EdgeData, EdgeType, SymbolType
+
+if TYPE_CHECKING:
+    from interlinked.analyzer.embeddings import EmbeddingIndex
 
 
 @dataclass
@@ -55,6 +57,10 @@ class StructuralFingerprint:
     # Source context
     docstring: str = ""
     source_snippet: str = ""
+    # AST tree (for tree edit distance — not serialized)
+    ast_tree: tuple | None = None
+    # Minhash signature (for LSH pre-filtering)
+    minhash: tuple[int, ...] = ()
 
 
 def analyze_similarity(graph: CodeGraph) -> None:
@@ -80,35 +86,54 @@ def find_duplicate_groups(
     graph: CodeGraph,
     threshold: float = 0.6,
     scope: str | None = None,
+    kind: str | None = None,
+    embedding_index: EmbeddingIndex | None = None,
 ) -> list[dict]:
-    """Find groups of structurally similar functions.
+    """Find groups of structurally similar symbols.
 
-    Uses nx.connected_components on a similarity threshold graph to cluster.
-    Returns a list of groups, each containing similar symbols with scores.
+    Uses minhash LSH pre-filter to avoid O(n²), then full scoring on candidates.
+    Clusters with nx.connected_components on a similarity threshold graph.
+
+    Args:
+        kind: Filter by symbol type — "function", "method", "class", or None for all.
     """
+    _KIND_MAP = {
+        "function": {SymbolType.FUNCTION},
+        "functions": {SymbolType.FUNCTION},
+        "method": {SymbolType.METHOD},
+        "methods": {SymbolType.METHOD},
+        "class": {SymbolType.CLASS},
+        "classes": {SymbolType.CLASS},
+    }
+    allowed = _KIND_MAP.get(kind.lower(), None) if kind else {SymbolType.FUNCTION, SymbolType.METHOD, SymbolType.CLASS}
+    if allowed is None:
+        allowed = {SymbolType.FUNCTION, SymbolType.METHOD, SymbolType.CLASS}
+
     all_nodes = graph.all_nodes(include_proposed=False)
     targets = [
         n for n in all_nodes
-        if n.symbol_type in (SymbolType.FUNCTION, SymbolType.METHOD)
+        if n.symbol_type in allowed
         and n.metadata.get("fingerprint")
     ]
 
     if scope:
         targets = [n for n in targets if n.qualified_name.startswith(scope)]
 
-    # Pairwise comparison — build a similarity graph
+    # Build minhash index for pre-filtering
+    fp_map = {n.id: n.metadata["fingerprint"] for n in targets}
+    candidates = _minhash_candidates(fp_map, bands=20, rows_per_band=5)
+
+    # Full scoring only on minhash candidate pairs
     sim_graph = nx.Graph()
     pairs: dict[tuple[str, str], float] = {}
-    for i, a in enumerate(targets):
-        for j in range(i + 1, len(targets)):
-            b = targets[j]
-            score = _similarity_score(
-                a.metadata["fingerprint"],
-                b.metadata["fingerprint"],
-            )
-            if score >= threshold:
-                sim_graph.add_edge(a.id, b.id, weight=score)
-                pairs[(a.id, b.id)] = score
+    for id_a, id_b in candidates:
+        score = _similarity_score(
+            fp_map[id_a], fp_map[id_b],
+            emb_index=embedding_index, id_a=id_a, id_b=id_b,
+        )
+        if score >= threshold:
+            sim_graph.add_edge(id_a, id_b, weight=score)
+            pairs[(id_a, id_b)] = score
 
     # Cluster using nx.connected_components
     result = []
@@ -148,6 +173,7 @@ def find_similar_to(
     graph: CodeGraph,
     target_id: str,
     threshold: float = 0.5,
+    embedding_index: EmbeddingIndex | None = None,
 ) -> list[dict]:
     """Find symbols similar to a specific target."""
     target_node = graph.get_node(target_id)
@@ -164,7 +190,10 @@ def find_similar_to(
         if not node.metadata.get("fingerprint"):
             continue
 
-        score = _similarity_score(target_fp, node.metadata["fingerprint"])
+        score = _similarity_score(
+            target_fp, node.metadata["fingerprint"],
+            emb_index=embedding_index, id_a=target_id, id_b=node.id,
+        )
         if score >= threshold:
             results.append({
                 "id": node.id,
@@ -353,7 +382,12 @@ def _find_ast_node(tree: ast.Module, target_line: int) -> ast.AST | None:
 
 
 def _analyze_ast_shape(node: ast.AST, fp: StructuralFingerprint) -> None:
-    """Analyze the AST shape of a function."""
+    """Analyze the AST shape of a function. Produces:
+    - ast_node_counts: bag-of-types for cosine comparison
+    - ast_tree: tuple tree for tree edit distance
+    - minhash: LSH signature for pre-filtering
+    - control flow booleans
+    """
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         args = node.args
         fp.arg_count = len(args.args) + len(args.posonlyargs) + len(args.kwonlyargs)
@@ -362,12 +396,13 @@ def _analyze_ast_shape(node: ast.AST, fp: StructuralFingerprint) -> None:
             fp.return_annotation = ast.dump(node.returns)
         fp.has_await = isinstance(node, ast.AsyncFunctionDef)
 
-    # Count AST node types and detect patterns
+    # Count AST node types, detect patterns, build tree tuple
     node_counts: Counter[str] = Counter()
     max_depth = [0]
 
-    def _walk_depth(n: ast.AST, depth: int) -> None:
-        node_counts[type(n).__name__] += 1
+    def _walk_depth(n: ast.AST, depth: int) -> tuple:
+        name = type(n).__name__
+        node_counts[name] += 1
         max_depth[0] = max(max_depth[0], depth)
 
         if isinstance(n, (ast.For, ast.While, ast.AsyncFor)):
@@ -381,70 +416,366 @@ def _analyze_ast_shape(node: ast.AST, fp: StructuralFingerprint) -> None:
         if isinstance(n, (ast.Await,)):
             fp.has_await = True
 
-        for child in ast.iter_child_nodes(n):
-            _walk_depth(child, depth + 1)
+        children = tuple(_walk_depth(child, depth + 1) for child in ast.iter_child_nodes(n))
+        return (name, children)
 
-    _walk_depth(node, 0)
+    fp.ast_tree = _walk_depth(node, 0)
     fp.ast_node_counts = dict(node_counts)
     fp.max_nesting_depth = max_depth[0]
 
+    # Compute minhash signature from AST token stream
+    fp.minhash = _compute_minhash(fp)
 
-# ── Internal: similarity scoring ─────────────────────────────────────
 
-def _similarity_score(fp_a: dict, fp_b: dict) -> float:
-    """Compute similarity between two fingerprint dicts. Returns 0.0-1.0."""
+# ── Minhash LSH pre-filtering ────────────────────────────────────────
+
+_NUM_HASHES = 100  # 100 hash functions for minhash
+
+
+def _compute_minhash(fp: StructuralFingerprint) -> tuple[int, ...]:
+    """Compute a minhash signature from the fingerprint's feature shingles."""
+    # Build shingles from multiple feature types
+    shingles: set[str] = set()
+
+    # AST node type bigrams (captures local structure)
+    if fp.ast_tree:
+        _ast_shingles(fp.ast_tree, shingles, depth=0, max_depth=6)
+
+    # Control flow pattern shingles
+    for feat in ("has_loops", "has_conditionals", "has_try_except", "has_yield", "has_await"):
+        if getattr(fp, feat, False):
+            shingles.add(f"flow:{feat}")
+
+    # Callee shingles (what the function calls, by last component)
+    for c in fp.callees:
+        shingles.add(f"calls:{c.split('.')[-1]}")
+    for r in fp.reads:
+        shingles.add(f"reads:{r.split('.')[-1]}")
+    for w in fp.writes:
+        shingles.add(f"writes:{w.split('.')[-1]}")
+
+    # Arg count bucket
+    shingles.add(f"args:{fp.arg_count}")
+
+    if not shingles:
+        return ()
+
+    # Compute minhash: for each hash function, take min hash over all shingles
+    sig = []
+    for i in range(_NUM_HASHES):
+        min_hash = float("inf")
+        for shingle in shingles:
+            h = _hash_shingle(shingle, i)
+            if h < min_hash:
+                min_hash = h
+        sig.append(int(min_hash) & 0xFFFFFFFF)
+    return tuple(sig)
+
+
+def _ast_shingles(tree: tuple, shingles: set[str], depth: int, max_depth: int) -> None:
+    """Extract AST path shingles from a tree tuple for minhash."""
+    if depth > max_depth:
+        return
+    name, children = tree
+    # Unigram
+    shingles.add(f"ast:{name}")
+    # Bigrams with children
+    for child in children:
+        child_name = child[0] if isinstance(child, tuple) else str(child)
+        shingles.add(f"ast:{name}>{child_name}")
+        if isinstance(child, tuple):
+            _ast_shingles(child, shingles, depth + 1, max_depth)
+
+
+def _hash_shingle(shingle: str, seed: int) -> int:
+    """Hash a shingle with a seed for minhash."""
+    data = f"{seed}:{shingle}".encode()
+    return int(hashlib.md5(data).hexdigest()[:8], 16)
+
+
+def _minhash_candidates(
+    fp_map: dict[str, dict],
+    bands: int = 20,
+    rows_per_band: int = 5,
+) -> set[tuple[str, str]]:
+    """Use LSH banding to find candidate pairs from minhash signatures.
+
+    Returns set of (id_a, id_b) pairs that are candidates for full scoring.
+    """
+    # Reconstruct minhash from fingerprint dicts
+    sigs: dict[str, tuple[int, ...]] = {}
+    for fid, fp in fp_map.items():
+        mh = tuple(fp.get("minhash", ()))
+        if mh:
+            sigs[fid] = mh
+
+    if not sigs:
+        # No minhash data — fall back to all pairs
+        ids = list(fp_map.keys())
+        return {(ids[i], ids[j]) for i in range(len(ids)) for j in range(i + 1, len(ids))}
+
+    # LSH banding: group signatures into bands, hash each band
+    candidates: set[tuple[str, str]] = set()
+    sig_len = min(len(s) for s in sigs.values())
+    actual_bands = min(bands, sig_len // max(rows_per_band, 1))
+    if actual_bands < 1:
+        actual_bands = 1
+        rows_per_band = sig_len
+
+    for band_idx in range(actual_bands):
+        buckets: dict[int, list[str]] = {}
+        start = band_idx * rows_per_band
+        end = start + rows_per_band
+
+        for fid, sig in sigs.items():
+            band_slice = sig[start:end]
+            band_hash = hash(band_slice)
+            buckets.setdefault(band_hash, []).append(fid)
+
+        # All pairs within each bucket are candidates
+        for bucket in buckets.values():
+            if len(bucket) < 2:
+                continue
+            for i in range(len(bucket)):
+                for j in range(i + 1, len(bucket)):
+                    a, b = bucket[i], bucket[j]
+                    key = (a, b) if a < b else (b, a)
+                    candidates.add(key)
+
+    return candidates
+
+
+# ── Tree Edit Distance (simplified Zhang-Shasha) ─────────────────────
+
+def _tree_edit_distance(t1: tuple | None, t2: tuple | None, max_ops: int = 80) -> int:
+    """Simplified tree edit distance between two AST tree tuples.
+
+    Uses a bounded recursive approach. Returns edit distance (lower = more similar).
+    Bounded by max_ops to prevent runaway computation on huge ASTs.
+    """
+    if t1 is None or t2 is None:
+        return max_ops
+    if t1 == t2:
+        return 0
+
+    name1, children1 = t1
+    name2, children2 = t2
+
+    # Relabel cost
+    cost = 0 if name1 == name2 else 1
+
+    # Align children using simple DP on the child sequences
+    n, m = len(children1), len(children2)
+
+    # For large child lists, use a greedy approximation
+    if n + m > 20:
+        return cost + abs(n - m) + min(n, m) // 3
+
+    # Standard sequence alignment DP
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if children1[i - 1] == children2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                sub_cost = _tree_edit_distance(children1[i - 1], children2[j - 1], max_ops // 3)
+                dp[i][j] = min(
+                    dp[i - 1][j] + 1,      # Delete
+                    dp[i][j - 1] + 1,       # Insert
+                    dp[i - 1][j - 1] + sub_cost,  # Substitute
+                )
+            if dp[i][j] > max_ops:
+                return max_ops
+
+    return cost + dp[n][m]
+
+
+def _ted_similarity(fp_a: dict, fp_b: dict) -> float:
+    """Tree edit distance similarity between two fingerprints. Returns 0.0-1.0."""
+    tree_a = fp_a.get("ast_tree")
+    tree_b = fp_b.get("ast_tree")
+    if not tree_a or not tree_b:
+        return 0.0
+
+    # Get tree sizes for normalization
+    size_a = _tree_size(tree_a)
+    size_b = _tree_size(tree_b)
+    max_size = max(size_a, size_b, 1)
+    min_size = min(size_a, size_b, 1)
+
+    # Skip if trees differ wildly in size — can't be similar
+    if max_size > 3 * min_size and max_size > 20:
+        return 0.0
+
+    # Bound the computation tightly
+    max_ops = min(max_size, 80)
+    dist = _tree_edit_distance(tree_a, tree_b, max_ops=max_ops)
+    return max(0.0, 1.0 - dist / max_size)
+
+
+def _tree_size(tree: tuple) -> int:
+    """Count nodes in a tree tuple."""
+    if not isinstance(tree, tuple) or len(tree) != 2:
+        return 1
+    _, children = tree
+    return 1 + sum(_tree_size(c) for c in children)
+
+
+# ── Weisfeiler-Lehman Graph Kernel ───────────────────────────────────
+
+def _wl_hash(fp: dict, iterations: int = 3) -> tuple[str, ...]:
+    """Compute Weisfeiler-Lehman neighborhood hash for a fingerprint.
+
+    Uses the callees/callers/reads/writes as a local neighborhood graph,
+    then iteratively hashes neighborhood labels.
+    """
+    # Build a simple neighborhood: node labels are the last component of qualified names
+    neighbors: dict[str, set[str]] = {}
+    center = "SELF"
+    neighbors[center] = set()
+
+    for c in fp.get("callees", []):
+        label = f"calls:{c.split('.')[-1]}"
+        neighbors[center].add(label)
+        neighbors.setdefault(label, set()).add(center)
+    for r in fp.get("reads", []):
+        label = f"reads:{r.split('.')[-1]}"
+        neighbors[center].add(label)
+        neighbors.setdefault(label, set()).add(center)
+    for w in fp.get("writes", []):
+        label = f"writes:{w.split('.')[-1]}"
+        neighbors[center].add(label)
+        neighbors.setdefault(label, set()).add(center)
+    for c in fp.get("callers", []):
+        label = f"caller:{c.split('.')[-1]}"
+        neighbors[center].add(label)
+        neighbors.setdefault(label, set()).add(center)
+
+    if not neighbors[center]:
+        return ()
+
+    # WL iterations: refine labels by incorporating neighbor labels
+    labels = {node: node for node in neighbors}
+    all_labels: list[str] = list(labels.values())
+
+    for _ in range(iterations):
+        new_labels = {}
+        for node in neighbors:
+            neighbor_labels = sorted(labels.get(n, n) for n in neighbors.get(node, set()))
+            combined = f"{labels[node]}|{'|'.join(neighbor_labels)}"
+            new_labels[node] = hashlib.md5(combined.encode()).hexdigest()[:8]
+        labels = new_labels
+        all_labels.extend(labels.values())
+
+    return tuple(sorted(all_labels))
+
+
+def _wl_similarity(fp_a: dict, fp_b: dict) -> float:
+    """WL kernel similarity between two fingerprints. Returns 0.0-1.0."""
+    wl_a = set(_wl_hash(fp_a))
+    wl_b = set(_wl_hash(fp_b))
+    if not wl_a and not wl_b:
+        return 0.0
+    if not wl_a or not wl_b:
+        return 0.0
+    return len(wl_a & wl_b) / max(len(wl_a | wl_b), 1)
+
+
+# ── Similarity scoring (upgraded) ────────────────────────────────────
+
+def _similarity_score(
+    fp_a: dict,
+    fp_b: dict,
+    emb_index: EmbeddingIndex | None = None,
+    id_a: str | None = None,
+    id_b: str | None = None,
+) -> float:
+    """Compute similarity between two fingerprint dicts. Returns 0.0-1.0.
+
+    Signals (weighted):
+    - Tree edit distance on ASTs (3.5) — structural comparison
+    - AST node type cosine (2.0) — bag-of-types fallback
+    - WL graph kernel on call neighborhoods (2.5)
+    - Callee Jaccard overlap (2.0)
+    - Argument pattern Jaccard (1.5)
+    - Control flow pattern match (1.5)
+    - Read/write overlap (1.0)
+    - Line count / nesting depth (0.5 each)
+    - Embedding cosine similarity (4.0) — when available, heaviest signal
+    """
     scores: list[tuple[float, float]] = []  # (score, weight)
 
-    # Argument pattern similarity
+    # Tree edit distance on ASTs (structural comparison)
+    ted_sim = _ted_similarity(fp_a, fp_b)
+    if ted_sim > 0.0:
+        scores.append((ted_sim, 3.5))
+
+    # AST node type cosine (fallback / complement to TED)
+    ast_a = fp_a.get("ast_node_counts", {})
+    ast_b = fp_b.get("ast_node_counts", {})
+    if ast_a and ast_b:
+        ast_sim = _cosine_similarity(ast_a, ast_b)
+        scores.append((ast_sim, 2.0))
+
+    # WL graph kernel on call neighborhood
+    wl_sim = _wl_similarity(fp_a, fp_b)
+    if wl_sim > 0.0:
+        scores.append((wl_sim, 2.5))
+
+    # Callee Jaccard overlap
+    callees_a = set(fp_a.get("callees", []))
+    callees_b = set(fp_b.get("callees", []))
+    if callees_a or callees_b:
+        callee_sim = len(callees_a & callees_b) / max(len(callees_a | callees_b), 1)
+        scores.append((callee_sim, 2.0))
+
+    # Argument pattern Jaccard
     args_a = set(fp_a.get("arg_names", []))
     args_b = set(fp_b.get("arg_names", []))
     if args_a or args_b:
         arg_sim = len(args_a & args_b) / max(len(args_a | args_b), 1)
-        scores.append((arg_sim, 2.0))
+        scores.append((arg_sim, 1.5))
 
     # Arg count similarity
     ac_a = fp_a.get("arg_count", 0)
     ac_b = fp_b.get("arg_count", 0)
     if ac_a + ac_b > 0:
-        scores.append((1.0 - abs(ac_a - ac_b) / max(ac_a + ac_b, 1), 1.0))
-
-    # Line count similarity
-    lc_a = fp_a.get("line_count", 0)
-    lc_b = fp_b.get("line_count", 0)
-    if lc_a > 0 and lc_b > 0:
-        scores.append((1.0 - abs(lc_a - lc_b) / max(lc_a, lc_b), 1.0))
-
-    # AST shape similarity (cosine similarity of node type counts)
-    ast_a = fp_a.get("ast_node_counts", {})
-    ast_b = fp_b.get("ast_node_counts", {})
-    if ast_a and ast_b:
-        ast_sim = _cosine_similarity(ast_a, ast_b)
-        scores.append((ast_sim, 3.0))  # Heavy weight — this is the shape
+        scores.append((1.0 - abs(ac_a - ac_b) / max(ac_a + ac_b, 1), 0.5))
 
     # Control flow pattern match
     flow_features = ["has_loops", "has_conditionals", "has_try_except", "has_yield", "has_await"]
     flow_match = sum(1 for f in flow_features if fp_a.get(f) == fp_b.get(f))
     scores.append((flow_match / len(flow_features), 1.5))
 
-    # Callee overlap (what they call)
-    callees_a = set(fp_a.get("callees", []))
-    callees_b = set(fp_b.get("callees", []))
-    if callees_a or callees_b:
-        callee_sim = len(callees_a & callees_b) / max(len(callees_a | callees_b), 1)
-        scores.append((callee_sim, 2.5))  # Strong signal
-
     # Read/write variable overlap
     reads_a = set(fp_a.get("reads", []))
     reads_b = set(fp_b.get("reads", []))
     if reads_a or reads_b:
         read_sim = len(reads_a & reads_b) / max(len(reads_a | reads_b), 1)
-        scores.append((read_sim, 1.5))
+        scores.append((read_sim, 1.0))
+
+    # Line count similarity
+    lc_a = fp_a.get("line_count", 0)
+    lc_b = fp_b.get("line_count", 0)
+    if lc_a > 0 and lc_b > 0:
+        scores.append((1.0 - abs(lc_a - lc_b) / max(lc_a, lc_b), 0.5))
 
     # Nesting depth similarity
     nd_a = fp_a.get("max_nesting_depth", 0)
     nd_b = fp_b.get("max_nesting_depth", 0)
     if nd_a > 0 or nd_b > 0:
         scores.append((1.0 - abs(nd_a - nd_b) / max(nd_a, nd_b, 1), 0.5))
+
+    # Embedding cosine similarity (Type 4 — when available)
+    if emb_index and emb_index.is_ready and id_a and id_b:
+        emb_sim = emb_index.cosine_similarity(id_a, id_b)
+        if emb_sim is not None:
+            scores.append((emb_sim, 4.0))
 
     if not scores:
         return 0.0
@@ -466,7 +797,7 @@ def _cosine_similarity(a: dict[str, int], b: dict[str, int]) -> float:
 
 
 def _fingerprint_to_dict(fp: StructuralFingerprint) -> dict:
-    """Convert a fingerprint to a serializable dict."""
+    """Convert a fingerprint to a serializable dict (stored on node.metadata)."""
     return {
         "arg_count": fp.arg_count,
         "arg_names": list(fp.arg_names),
@@ -483,4 +814,6 @@ def _fingerprint_to_dict(fp: StructuralFingerprint) -> dict:
         "callers": list(fp.callers),
         "reads": list(fp.reads),
         "writes": list(fp.writes),
+        "ast_tree": fp.ast_tree,
+        "minhash": list(fp.minhash),
     }

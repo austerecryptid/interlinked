@@ -1,25 +1,34 @@
-"""Dead code detection via NetworkX graph queries.
+"""Dead code detection via forward reachability from production entry points.
 
-All detection is done through native NetworkX degree/reachability queries
-on the typed MultiDiGraph. No manual graph traversal.
+A symbol is dead if no production execution path can reach it.  This is
+computed by building a calls-graph (including decorator registrations and
+module/class-level calls captured by the parser) and doing a forward BFS
+from every production entry point.
 
-Detects:
-  - Uncalled functions/methods (zero in-degree on 'calls' + 'reads' keys)
-  - Dead parameters (zero in-degree on 'reads' key)
-  - Dead variables (has 'writes' in-edges but zero 'reads' in-edges)
-  - Dead returns (RETURNS edges whose targets have zero 'reads' in-edges)
+Entry points:
+  - Module nodes (their scope-level code runs on import)
+  - Dunder methods (called by the Python runtime)
+  - ``main``, ``setup``/``teardown`` and similar framework hooks
+  - Decorated functions (the parser emits calls edges from decorator → fn)
+
+*Test-only reachability does not count.* If a symbol is reachable only from
+``test_*`` functions, it is still flagged as dead — tests exercise code,
+they don't make it production-live.
+
+Additionally detects:
+  - Dead variables (written but never read)
+  - Dead return edges (return value never consumed)
   - Dead imports (target not a project node and not a prefix of one)
-  - Transitive dead (all ancestors in calls graph are already dead)
 """
 
 from __future__ import annotations
 
-import networkx as nx
+from collections import deque
 
 from interlinked.analyzer.graph import CodeGraph
 from interlinked.models import EdgeType, SymbolType
 
-_EXEMPT: frozenset[str] = frozenset({
+_EXEMPT_NAMES: frozenset[str] = frozenset({
     "__init__", "__new__", "__del__", "__repr__", "__str__",
     "__enter__", "__exit__", "__aenter__", "__aexit__",
     "__iter__", "__next__", "__len__", "__getitem__", "__setitem__",
@@ -31,36 +40,109 @@ _EXEMPT: frozenset[str] = frozenset({
 
 
 def detect_dead_code(graph: CodeGraph) -> list[str]:
-    """Mark dead nodes/edges using NetworkX queries. Returns dead node IDs."""
+    """Mark dead nodes/edges using forward reachability. Returns dead node IDs."""
     G = graph._g
-    dead: set[str] = set()
-    node_ids = {n.id for n in graph.all_nodes(include_proposed=False)}
+    all_nodes = graph.all_nodes(include_proposed=False)
+    node_ids = {n.id for n in all_nodes}
 
-    # ── Uncalled functions ────────────────────────────────────────
-    for n in graph.all_nodes(include_proposed=False):
+    # ── Build adjacency maps ─────────────────────────────────────
+    # calls/reads: execution flow — "X invokes or references Y"
+    call_fwd: dict[str, set[str]] = {}
+    # contains: structural — "X's scope defines Y"
+    contains_fwd: dict[str, set[str]] = {}
+    # inherits: class → base class
+    inherits_targets: dict[str, set[str]] = {}
+
+    for u, v, d in G.edges(data=True):
+        etype = d.get("edge_type")
+        if etype in ("calls", "reads"):
+            call_fwd.setdefault(u, set()).add(v)
+        elif etype == "contains":
+            contains_fwd.setdefault(u, set()).add(v)
+        elif etype == "inherits":
+            inherits_targets.setdefault(u, set()).add(v)
+
+    # Which nodes are classes?
+    class_ids = {n.id for n in all_nodes if n.symbol_type == SymbolType.CLASS}
+
+    # Classes that inherit from serializable bases (Pydantic BaseModel,
+    # dataclasses, etc.). Their fields are implicitly read by framework
+    # serialization machinery — model_dump(), asdict(), etc.
+    _SERIALIZABLE_BASES = {"BaseModel", "Model", "Schema"}
+    serializable_class_ids: set[str] = set()
+    for cls_id in class_ids:
+        for base in inherits_targets.get(cls_id, ()):
+            base_short = base.rsplit(".", 1)[-1] if "." in base else base
+            if base_short in _SERIALIZABLE_BASES:
+                serializable_class_ids.add(cls_id)
+
+    # ── Identify production entry points ──────────────────────────
+    # Modules are roots — their scope-level code runs on import.
+    # Dunder methods and framework hooks are implicitly invoked.
+    entry_points: set[str] = set()
+    for n in all_nodes:
+        if n.symbol_type == SymbolType.MODULE:
+            entry_points.add(n.id)
+        elif n.name in _EXEMPT_NAMES:
+            entry_points.add(n.id)
+
+    # ── Forward BFS from production entry points ──────────────────
+    # When we reach a node, follow its calls/reads edges.
+    # When we reach a CLASS, also follow its contains edges — instantiating
+    # a class makes all its methods callable (handles visitor pattern,
+    # framework base classes, etc.).
+    reachable: set[str] = set()
+    queue: deque[str] = deque(entry_points)
+    while queue:
+        nid = queue.popleft()
+        if nid in reachable:
+            continue
+        reachable.add(nid)
+        # Follow execution edges
+        for target in call_fwd.get(nid, ()):
+            if target not in reachable:
+                queue.append(target)
+        # If this is a class, reaching it means its methods are callable
+        if nid in class_ids:
+            for child in contains_fwd.get(nid, ()):
+                if child not in reachable:
+                    queue.append(child)
+
+    # ── Mark unreachable functions/methods as dead ─────────────────
+    dead: set[str] = set()
+    for n in all_nodes:
         if n.symbol_type not in (SymbolType.FUNCTION, SymbolType.METHOD):
             continue
-        if n.name in _EXEMPT or n.name.startswith("test_"):
+        # Test functions are not dead — they're tests
+        if n.name.startswith("test_"):
             continue
-        if n.id not in G:
+        # Exempt names are never dead
+        if n.name in _EXEMPT_NAMES:
             continue
-        # No incoming calls AND no incoming reads (callback references)
-        has_caller = any(
-            d.get("edge_type") in ("calls", "reads")
-            for _, _, d in G.in_edges(n.id, data=True)
-        )
-        if not has_caller:
+        # If not reachable from any production entry point → dead
+        if n.id not in reachable:
             n.is_dead = True
             dead.add(n.id)
 
-    # ── Dead parameters (never read) ─────────────────────────────
-    for n in graph.all_nodes(include_proposed=False):
+    # ── Dead parameters (parent is dead, or never read) ───────────
+    for n in all_nodes:
         if n.symbol_type != SymbolType.PARAMETER or n.name in ("self", "cls"):
             continue
-        # Skip params of already-dead functions
         parent = n.id.rsplit(".", 1)[0] if "." in n.id else ""
         if parent in dead:
+            n.is_dead = True
+            dead.add(n.id)
             continue
+        # If the parent function has incoming 'reads' edges, it's being
+        # referenced as a value (passed as callback, stored in a variable,
+        # etc.). Its parameters are contract-obligated by whatever receives it.
+        if parent in G:
+            has_reads_edge = any(
+                d.get("edge_type") == "reads"
+                for _, _, d in G.in_edges(parent, data=True)
+            )
+            if has_reads_edge:
+                continue
         if n.id not in G:
             continue
         has_reader = any(
@@ -71,11 +153,16 @@ def detect_dead_code(graph: CodeGraph) -> list[str]:
             n.is_dead = True
             dead.add(n.id)
 
-    # ── Dead variables (written but never read) ──────────────────
-    for n in graph.all_nodes(include_proposed=False):
+    # ── Dead variables (written but never read) ───────────────────
+    for n in all_nodes:
         if n.symbol_type != SymbolType.VARIABLE:
             continue
         if n.id not in G:
+            continue
+        # If this variable is a field on a serializable class (BaseModel etc.),
+        # it's implicitly read by framework serialization machinery.
+        parent = n.id.rsplit(".", 1)[0] if "." in n.id else ""
+        if parent in serializable_class_ids:
             continue
         has_writer = any(d.get("edge_type") == "writes" for _, _, d in G.in_edges(n.id, data=True))
         has_reader = any(d.get("edge_type") == "reads" for _, _, d in G.in_edges(n.id, data=True))
@@ -83,8 +170,8 @@ def detect_dead_code(graph: CodeGraph) -> list[str]:
             n.is_dead = True
             dead.add(n.id)
 
-    # ── Dead returns (return value never read) ───────────────────
-    for n in graph.all_nodes(include_proposed=False):
+    # ── Dead returns (return value never read) ────────────────────
+    for n in all_nodes:
         if n.symbol_type not in (SymbolType.FUNCTION, SymbolType.METHOD):
             continue
         if n.id in dead or n.id not in G:
@@ -100,11 +187,10 @@ def detect_dead_code(graph: CodeGraph) -> list[str]:
             for rt in ret_targets
         )
         if not any_read:
-            # Mark the return edges as dead, not the function
             for e in graph.edges_from(n.id, EdgeType.RETURNS):
                 e.is_dead = True
 
-    # ── Dead imports ─────────────────────────────────────────────
+    # ── Dead imports ──────────────────────────────────────────────
     for e in graph.all_edges(include_proposed=False):
         if e.edge_type != EdgeType.IMPORTS:
             continue
@@ -112,26 +198,5 @@ def detect_dead_code(graph: CodeGraph) -> list[str]:
             is_prefix = any(nid.startswith(e.target) for nid in node_ids)
             if is_prefix:
                 e.is_dead = True
-
-    # ── Transitive dead ──────────────────────────────────────────
-    # If ALL ancestors of a function in the calls graph are dead, it's dead too
-    calls_graph = G.edge_subgraph(
-        [(u, v, k) for u, v, k in G.edges(keys=True) if k == "calls"]
-    )
-    changed = True
-    while changed:
-        changed = False
-        for n in graph.all_nodes(include_proposed=False):
-            if n.is_dead or n.id not in calls_graph:
-                continue
-            if n.symbol_type not in (SymbolType.FUNCTION, SymbolType.METHOD):
-                continue
-            if n.name in _EXEMPT or n.name.startswith("test_"):
-                continue
-            callers = set(calls_graph.predecessors(n.id))
-            if callers and callers.issubset(dead):
-                n.is_dead = True
-                dead.add(n.id)
-                changed = True
 
     return list(dead)

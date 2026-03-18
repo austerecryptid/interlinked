@@ -80,7 +80,7 @@ class ViewContext(BaseModel):
 
 class ViewState(BaseModel):
     """Current state of the visualization — what the user sees."""
-    zoom_level: str = "function"  # module, class, function
+    zoom_level: str = "module"  # module, class, function
     focus_node: str | None = None
     focus_depth: int = 2
     visible_node_ids: list[str] = Field(default_factory=list)
@@ -98,6 +98,19 @@ class ViewState(BaseModel):
     show_proposed: bool = True
     filter_expression: str | None = None
     context: ViewContext = Field(default_factory=ViewContext)
+
+
+class GraphDelta(BaseModel):
+    """Diff between two graph states — sent via SSE instead of full snapshots."""
+    added_nodes: list[NodeData] = Field(default_factory=list)
+    removed_node_ids: list[str] = Field(default_factory=list)
+    updated_nodes: list[NodeData] = Field(default_factory=list)
+    added_edges: list[EdgeData] = Field(default_factory=list)
+    removed_edges: list[EdgeData] = Field(default_factory=list)
+    view: ViewState
+    layout_updates: dict[str, dict[str, float]] = Field(default_factory=dict)
+    # If true, the client should discard its state and use this as a full snapshot
+    full_snapshot: bool = False
 
 
 class GraphSnapshot(BaseModel):

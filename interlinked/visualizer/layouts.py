@@ -28,13 +28,22 @@ def compute_layout(
     nodes: list[NodeData],
     edges: list[EdgeData],
     algorithm: str = "force",
-    width: float = 1200,
-    height: float = 800,
+    width: float | None = None,
+    height: float | None = None,
 ) -> dict[str, dict[str, float]]:
     """Compute x,y positions for each node.
 
+    Canvas scales with sqrt(node count) so spacing stays consistent
+    whether you have 20 nodes or 65,000.
+
     Returns: {node_id: {"x": float, "y": float}}
     """
+    n = len(nodes)
+    scale = max(1.0, math.sqrt(n)) * 2  # generous: ~6x at 10 nodes, ~32x at 250, ~510x at 65k
+    if width is None:
+        width = 1200 * scale
+    if height is None:
+        height = 800 * scale
     if not nodes:
         return {}
 
@@ -69,30 +78,22 @@ def _force_layout(
     nodes: list[NodeData],
     edges: list[EdgeData],
 ) -> dict[str, tuple[float, float]]:
-    """Force-directed layout using networkx (numpy-accelerated)."""
-    import networkx as nx
-
-    node_ids = [n.id for n in nodes]
-    n = len(node_ids)
+    """Fast scatter layout — O(n). Real layout is done by FA2 on the frontend."""
+    n = len(nodes)
     if n == 0:
         return {}
     if n == 1:
-        return {node_ids[0]: (0.0, 0.0)}
+        return {nodes[0].id: (0.0, 0.0)}
 
-    id_set = set(node_ids)
-
-    G = nx.Graph()
-    G.add_nodes_from(node_ids)
-    for e in edges:
-        if e.source in id_set and e.target in id_set:
-            G.add_edge(e.source, e.target)
-
-    # Scale iterations: fewer for larger graphs (still fast with numpy)
-    iters = 50 if n < 1000 else 20 if n < 10000 else 10
-    k = math.sqrt(4.0 / max(n, 1))
-
-    pos = nx.spring_layout(G, k=k, iterations=iters, seed=42)
-    return {nid: (float(xy[0]), float(xy[1])) for nid, xy in pos.items()}
+    # Place nodes in a spiral so they start spread out and non-overlapping.
+    # FA2 on the frontend will refine from here.
+    pos: dict[str, tuple[float, float]] = {}
+    golden_angle = math.pi * (3 - math.sqrt(5))  # ~137.5°
+    for i, node in enumerate(nodes):
+        r = math.sqrt(i + 1) / math.sqrt(n)  # radius grows with sqrt
+        theta = i * golden_angle
+        pos[node.id] = (r * math.cos(theta), r * math.sin(theta))
+    return pos
 
 
 def _hierarchical_layout(

@@ -210,7 +210,8 @@ class QueryEngine:
         return f"Visible edge types: {[e.value for e in self.state.visible_edge_types]}"
 
     def reset_filter(self) -> str:
-        """Reset all filters to show everything."""
+        """Reset all filters to module-level overview."""
+        self.state.zoom_level = "module"
         self.state.visible_node_ids = []
         self.state.visible_edge_types = list(EdgeType)
         self.state.focus_node = None
@@ -219,7 +220,7 @@ class QueryEngine:
         self.state.trace_node_roles = {}
         self.state.trace_edge_roles = {}
         self._notify()
-        return "All filters reset."
+        return "Reset to module-level overview."
 
     # ── Queries ──────────────────────────────────────────────────────
 
@@ -371,6 +372,35 @@ class QueryEngine:
 
         # Highlight results in the view
         self.state.highlighted_node_ids = [n.id for n in results]
+
+        # Build WHAT / WHERE / WHY context banner
+        if results:
+            types = {}
+            for r in results:
+                t = r.symbol_type.value if hasattr(r.symbol_type, 'value') else str(r.symbol_type)
+                types[t] = types.get(t, 0) + 1
+            type_str = ", ".join(f"{v} {k}{'s' if v != 1 else ''}" for k, v in sorted(types.items(), key=lambda x: -x[1]))
+            sample = [r.name for r in results[:5]]
+            sample_str = ", ".join(sample) + ("..." if len(results) > 5 else "")
+
+            # Determine modules involved
+            modules = sorted({r.qualified_name.split(".")[0] for r in results})
+            where_str = ", ".join(modules[:6]) + ("..." if len(modules) > 6 else "")
+
+            self.state.context = ViewContext(
+                what=f"Query '{expression}' — {len(results)} results ({type_str})",
+                why=f"Matching symbols: {sample_str}",
+                where=f"Across: {where_str}",
+                source="query",
+            )
+        else:
+            self.state.context = ViewContext(
+                what=f"Query '{expression}' — no results",
+                why="No symbols matched this query",
+                where="",
+                source="query",
+            )
+
         self._notify()
 
         return [r.model_dump() for r in results]
@@ -731,17 +761,30 @@ class QueryEngine:
 
     # ── Similarity / Duplication ──────────────────────────────────────
 
-    def find_duplicates(self, threshold: float = 0.6, scope: str | None = None) -> str:
-        """Find groups of structurally similar functions — potential duplicated functionality.
+    def find_duplicates(self, threshold: float = 0.6, scope: str | None = None, kind: str | None = None) -> str:
+        """Find groups of structurally similar symbols — potential duplicated functionality.
 
         Args:
             threshold: Similarity threshold 0.0-1.0 (default 0.6). Lower = more results.
             scope: Optional prefix to limit search, e.g. "analyzer" or "commander.query".
+            kind: Filter by type — "function", "method", "class", or None for all.
 
         Returns JSON with groups of similar symbols, sorted by similarity score.
         """
         from interlinked.analyzer.similarity import find_duplicate_groups
-        groups = find_duplicate_groups(self.graph, threshold=threshold, scope=scope)
+        emb_index = getattr(self, '_embedding_index', None)
+        groups = find_duplicate_groups(self.graph, threshold=threshold, scope=scope, kind=kind, embedding_index=emb_index)
+
+        # Switch zoom level to match the kind being searched
+        _KIND_TO_ZOOM = {
+            "function": "function", "functions": "function",
+            "method": "function",   "methods": "function",
+            "class": "class",       "classes": "class",
+        }
+        if kind:
+            self.state.zoom_level = _KIND_TO_ZOOM.get(kind.lower(), "function")
+        else:
+            self.state.zoom_level = "function"
 
         # Highlight all members of duplicate groups in the view
         all_ids = []
@@ -749,18 +792,35 @@ class QueryEngine:
             for member in group["members"]:
                 all_ids.append(member["id"])
         self.state.highlighted_node_ids = all_ids
+
+        _KIND_PLURAL = {"class": "classes", "function": "functions", "method": "methods"}
+        kind_label = _KIND_PLURAL.get(kind, "functions/methods") if kind else "functions/methods"
+        scope_label = f" in {scope}" if scope else ""
+        self.state.context = ViewContext(
+            what=f"Duplicate {kind_label}{scope_label} (threshold {threshold})",
+            why=f"Found {len(groups)} groups, {len(all_ids)} symbols with similar structure",
+            where="Similarity analysis (minhash + TED + WL kernel" + (" + embeddings" if emb_index and emb_index.is_ready else "") + ")",
+            source="similarity",
+        )
         self._notify()
 
-        if not groups:
-            return json.dumps({"message": f"No duplicate groups found at threshold {threshold}.", "groups": []})
-        return json.dumps({"message": f"Found {len(groups)} groups of similar symbols.", "groups": groups}, indent=2)
+        emb_note = ""
+        if emb_index and emb_index.status == "building":
+            emb_note = f" (Embedding index building: {int(emb_index.progress * 100)}% — results will improve when complete)"
+        elif emb_index and emb_index.status == "idle":
+            emb_note = " (Install interlinked[similarity] for Type 4 semantic detection)"
 
-    def similar_to(self, target: str, threshold: float = 0.5) -> str:
+        if not groups:
+            return json.dumps({"message": f"No duplicate groups found at threshold {threshold}.{emb_note}", "groups": []})
+        return json.dumps({"message": f"Found {len(groups)} groups of similar symbols.{emb_note}", "groups": groups}, indent=2)
+
+    def similar_to(self, target: str, threshold: float = 0.5, top: int = 10) -> str:
         """Find functions/classes structurally similar to a given symbol.
 
         Args:
             target: Name or partial name of the symbol to compare against.
             threshold: Similarity threshold 0.0-1.0.
+            top: Max results to highlight (default 10). Pass 0 for unlimited.
         """
         from interlinked.analyzer.similarity import find_similar_to
 
@@ -775,10 +835,33 @@ class QueryEngine:
                 return json.dumps({"error": f"No symbol matching '{target}' found."})
             node = min(matches, key=lambda n: len(n.qualified_name))
 
-        results = find_similar_to(self.graph, node.id, threshold=threshold)
+        emb_index = getattr(self, '_embedding_index', None)
+        results = find_similar_to(self.graph, node.id, threshold=threshold, embedding_index=emb_index)
+
+        # Cap results for UI clarity (already sorted by score descending)
+        if top > 0:
+            results = results[:top]
+
+        # Switch zoom level to match the target's symbol type
+        _TYPE_TO_ZOOM = {
+            SymbolType.MODULE: "module",
+            SymbolType.CLASS: "class",
+            SymbolType.FUNCTION: "function",
+            SymbolType.METHOD: "function",
+            SymbolType.VARIABLE: "variable",
+            SymbolType.PARAMETER: "variable",
+        }
+        self.state.zoom_level = _TYPE_TO_ZOOM.get(node.symbol_type, "function")
 
         # Highlight similar symbols
         self.state.highlighted_node_ids = [node.id] + [r["id"] for r in results]
+        top_score = f"{results[0]['similarity']:.0%}" if results else "n/a"
+        self.state.context = ViewContext(
+            what=f"Symbols similar to '{node.name}'",
+            why=f"{len(results)} matches (top similarity: {top_score}, threshold: {threshold})",
+            where=f"{node.qualified_name} ({node.file_path})",
+            source="similarity",
+        )
         self._notify()
 
         if not results:

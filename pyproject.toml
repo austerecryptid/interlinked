@@ -29,7 +29,11 @@ dependencies = [
     "pydantic>=2.0",
     "httpx>=0.27",
     "mcp>=1.0",
+    "watchfiles>=0.21",
 ]
+
+[project.optional-dependencies]
+similarity = ["torch>=2.0", "transformers>=4.30"]
 
 [project.urls]
 Homepage = "https://github.com/austerecryptid/interlinked"

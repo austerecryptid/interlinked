@@ -56,6 +56,32 @@ def build_graph(project_path: str) -> tuple[CodeGraph, QueryEngine]:
         pass
 
     engine = QueryEngine(graph)
+
+    # Start embedding build in background (if torch/transformers installed)
+    try:
+        from interlinked.analyzer.embeddings import EmbeddingIndex, is_available
+        if is_available():
+            from pathlib import Path
+            emb_index = EmbeddingIndex(project_path)
+            engine._embedding_index = emb_index
+            # Collect function sources
+            from interlinked.models import SymbolType
+            functions = []
+            for node in graph.all_nodes(include_proposed=False):
+                if node.symbol_type not in (SymbolType.FUNCTION, SymbolType.METHOD):
+                    continue
+                if node.file_path and node.line_start and node.line_end:
+                    try:
+                        lines = Path(node.file_path).read_text(encoding="utf-8", errors="replace").splitlines()
+                        source = "\n".join(lines[max(0, node.line_start - 1):min(len(lines), node.line_end)])
+                        if source:
+                            functions.append({"id": node.id, "source": source})
+                    except Exception:
+                        pass
+            emb_index.build_async(functions)
+    except Exception:
+        pass
+
     return graph, engine
 
 
@@ -178,12 +204,13 @@ def create_mcp_server(project_path: str) -> Server:
             ),
             Tool(
                 name="interlinked_find_duplicates",
-                description="Find functions/methods with similar structure, signatures, or logic paths — potential duplicated functionality. Returns groups of similar symbols with similarity scores.",
+                description="Find symbols with similar structure, signatures, or logic paths — potential duplicated functionality. Returns groups of similar symbols with similarity scores. Highlights results in the graph UI.",
                 inputSchema={
                     "type": "object",
                     "properties": {
-                        "threshold": {"type": "number", "description": "Similarity threshold 0.0-1.0 (default 0.6)", "default": 0.6},
-                        "scope": {"type": "string", "description": "Optional: limit search to symbols under this prefix"},
+                        "threshold": {"type": "number", "description": "Similarity threshold 0.0-1.0 (default 0.6). Lower = more results.", "default": 0.6},
+                        "scope": {"type": "string", "description": "Optional: limit search to symbols under this prefix, e.g. 'analyzer' or 'commander.query'"},
+                        "kind": {"type": "string", "enum": ["function", "method", "class"], "description": "Optional: filter by symbol type — 'function', 'method', or 'class'. Omit for all."},
                     },
                     "required": [],
                 },
@@ -262,8 +289,37 @@ def create_mcp_server(project_path: str) -> Server:
             ),
             Tool(
                 name="interlinked_reset",
-                description="Reset all filters, focus, and highlights back to the default full-graph view.",
+                description="Reset all filters, focus, and highlights back to module-level overview.",
                 inputSchema={"type": "object", "properties": {}, "required": []},
+            ),
+            Tool(
+                name="interlinked_ui_status",
+                description="Check if the Interlinked web UI server is running. Returns the URL if running, or instructions to start it. Use this before trying to push visual results to the user.",
+                inputSchema={"type": "object", "properties": {}, "required": []},
+            ),
+            Tool(
+                name="interlinked_set_context",
+                description="Push an explanation message to the UI. The message appears as a context banner over the graph, explaining what the user is looking at and why. Use this after running queries to explain results visually.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "what": {"type": "string", "description": "What is being shown in the visualization"},
+                        "why": {"type": "string", "description": "Why this view was chosen / what question it answers"},
+                        "where": {"type": "string", "description": "Which part of the codebase (scope/modules/symbols)"},
+                    },
+                    "required": ["what"],
+                },
+            ),
+            Tool(
+                name="interlinked_start_ui",
+                description="Start the Interlinked web visualization server if it is not already running. Returns the URL to open in the browser. The server runs as a background process and persists after this call.",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "port": {"type": "integer", "description": "Port to run on (default: 8420)", "default": 8420},
+                    },
+                    "required": [],
+                },
             ),
             Tool(
                 name="interlinked_set_api_key",
@@ -283,6 +339,29 @@ def create_mcp_server(project_path: str) -> Server:
         nonlocal api_key
 
         try:
+            # Handle ui_status first — it doesn't need graph or server proxy
+            if name == "interlinked_ui_status":
+                server_url = _check_server()
+                if server_url:
+                    result = json.dumps({
+                        "running": True,
+                        "url": server_url,
+                        "message": f"Interlinked UI is running at {server_url}. All visualization commands will be displayed there.",
+                    })
+                else:
+                    result = json.dumps({
+                        "running": False,
+                        "start_tool": "interlinked_start_ui",
+                        "message": "Interlinked UI is not running. Call interlinked_start_ui to launch it, or the user can run: interlinked analyze " + str(project_path),
+                    })
+                return [TextContent(type="text", text=result)]
+
+            # Handle start_ui — needs to spawn the server process
+            if name == "interlinked_start_ui":
+                port = arguments.get("port", 8420)
+                result = _start_ui(project_path, port)
+                return [TextContent(type="text", text=result)]
+
             # Try proxying through the running web server first
             server_url = _check_server()
             if server_url:
@@ -302,6 +381,70 @@ def create_mcp_server(project_path: str) -> Server:
             return [TextContent(type="text", text=f"Error: {e}")]
 
     return server
+
+
+def _start_ui(project_path: str, port: int = 8420) -> str:
+    """Spawn the Interlinked web server as a background process.
+
+    Returns JSON with the URL and status. If already running, returns immediately.
+    """
+    import subprocess
+    import time
+
+    url = f"http://127.0.0.1:{port}"
+
+    # Already running?
+    try:
+        r = httpx.get(f"{url}/api/stats", timeout=1.0)
+        if r.status_code == 200:
+            return json.dumps({
+                "status": "already_running",
+                "url": url,
+                "message": f"Interlinked UI is already running at {url}",
+            })
+    except Exception:
+        pass
+
+    # Spawn as a detached background process
+    cmd = [
+        sys.executable, "-c",
+        "import uvicorn; "
+        "from interlinked.visualizer.server import create_app, _rebuild_graph; "
+        "from interlinked.analyzer.graph import CodeGraph; "
+        "graph = CodeGraph(); "
+        f"_rebuild_graph({project_path!r}, graph); "
+        f"app = create_app(graph, initial_path={project_path!r}); "
+        f"uvicorn.run(app, host='0.0.0.0', port={port}, log_level='warning')",
+    ]
+    try:
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return json.dumps({"status": "error", "message": f"Failed to start server: {e}"})
+
+    # Wait for it to come up (up to 15s for large projects)
+    for _ in range(30):
+        time.sleep(0.5)
+        try:
+            r = httpx.get(f"{url}/api/stats", timeout=1.0)
+            if r.status_code == 200:
+                return json.dumps({
+                    "status": "started",
+                    "url": url,
+                    "message": f"Interlinked UI started at {url}",
+                })
+        except Exception:
+            pass
+
+    return json.dumps({
+        "status": "timeout",
+        "url": url,
+        "message": f"Server process spawned but not responding yet at {url}. It may still be parsing the project — try interlinked_ui_status in a few seconds.",
+    })
 
 
 def _dispatch_via_server(name: str, args: dict[str, Any], server_url: str) -> str | None:
@@ -339,6 +482,7 @@ def _dispatch_via_server(name: str, args: dict[str, Any], server_url: str) -> st
         "interlinked_find_duplicates": ("POST", "/api/find_duplicates", {
             "threshold": args.get("threshold", 0.6),
             "scope": args.get("scope"),
+            "kind": args.get("kind"),
         }),
         "interlinked_similar_to":  ("POST", "/api/similar_to", {
             "target": args.get("target", ""),
@@ -359,6 +503,11 @@ def _dispatch_via_server(name: str, args: dict[str, Any], server_url: str) -> st
             "max_depth": args.get("max_depth", 20),
         }),
         "interlinked_reset":       ("POST", "/api/reset", {}),
+        "interlinked_set_context": ("POST", "/api/set_context", {
+            "what": args.get("what", ""),
+            "why": args.get("why", ""),
+            "where": args.get("where", ""),
+        }),
     }
 
     if name not in _TOOL_TO_ENDPOINT:
@@ -436,7 +585,8 @@ def _dispatch_tool(
     elif name == "interlinked_find_duplicates":
         threshold = args.get("threshold", 0.6)
         scope = args.get("scope")
-        return engine.find_duplicates(threshold=threshold, scope=scope)
+        kind = args.get("kind")
+        return engine.find_duplicates(threshold=threshold, scope=scope, kind=kind)
 
     elif name == "interlinked_similar_to":
         return engine.similar_to(args["target"], threshold=args.get("threshold", 0.5))
@@ -445,13 +595,26 @@ def _dispatch_tool(
         return engine.get_context(args["target"])
 
     elif name == "interlinked_command":
+        import signal
+
         cmd = args["command"]
         local_ns: dict[str, Any] = {"view": engine, "graph": graph}
+
+        def _timeout_handler(signum, frame):
+            raise TimeoutError("Command execution timed out (5s limit)")
+
+        old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(5)
         try:
-            result = eval(cmd, {"__builtins__": {}}, local_ns)
-        except SyntaxError:
-            exec(cmd, {"__builtins__": {}}, local_ns)
-            result = "OK"
+            try:
+                result = eval(cmd, {"__builtins__": {}}, local_ns)
+            except SyntaxError:
+                exec(cmd, {"__builtins__": {}}, local_ns)
+                result = "OK"
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
+
         if hasattr(result, "model_dump"):
             return json.dumps(result.model_dump(), indent=2)
         return str(result)
@@ -479,6 +642,17 @@ def _dispatch_tool(
 
     elif name == "interlinked_reset":
         return engine.reset_filter()
+
+    elif name == "interlinked_set_context":
+        from interlinked.models import ViewContext
+        engine.state.context = ViewContext(
+            what=args.get("what", ""),
+            why=args.get("why", ""),
+            where=args.get("where", ""),
+            source="mcp",
+        )
+        engine._notify()
+        return "Context updated on UI."
 
     elif name == "interlinked_set_api_key":
         return ""  # handled in call_tool

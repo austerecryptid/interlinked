@@ -35,6 +35,10 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Frontend
+interlinked/visualizer/frontend/node_modules/
+interlinked/visualizer/frontend/dist/
+
 # Misc
 *.log
 .env

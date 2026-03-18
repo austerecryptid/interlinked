@@ -44,6 +44,143 @@ _BUILTINS: frozenset[str] = frozenset(dir(builtins)) | frozenset({
 
 
 
+def parse_file(
+    file_path: str | Path,
+    module_qname: str,
+    existing_node_ids: set[str] | None = None,
+    existing_type_index: dict[str, str] | None = None,
+) -> tuple[list[NodeData], list[EdgeData]]:
+    """Parse a single Python file and return its nodes + resolved edges.
+
+    This is the incremental counterpart to parse_project(). It parses one file
+    and resolves edges using optional context from the existing graph.
+
+    Args:
+        file_path: Absolute path to the .py file.
+        module_qname: Dotted module name (e.g. "analyzer.graph").
+        existing_node_ids: Node IDs from the rest of the graph (for edge resolution).
+        existing_type_index: Type index from the rest of the graph (class/module short name -> qname).
+
+    Returns:
+        (nodes, edges) — fully resolved for this file, ready for CodeGraph.update_file().
+    """
+    file_path = Path(file_path)
+    try:
+        source = file_path.read_text(encoding="utf-8", errors="replace")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(source, filename=str(file_path))
+    except SyntaxError:
+        return [], []
+
+    # Pass 1: extract symbols and raw edges
+    nodes, edges = _extract_from_module(tree, source, module_qname, str(file_path))
+
+    # Build combined node ID set and type index
+    node_ids = {n.id for n in nodes}
+    if existing_node_ids:
+        node_ids |= existing_node_ids
+
+    type_index: dict[str, str] = dict(existing_type_index) if existing_type_index else {}
+    for n in nodes:
+        if n.symbol_type in (SymbolType.CLASS, SymbolType.MODULE):
+            type_index[n.name] = n.id
+            parts = n.qualified_name.split(".")
+            for i in range(len(parts)):
+                suffix = ".".join(parts[i:])
+                type_index.setdefault(suffix, n.id)
+
+    # Pass 2: type inference
+    inferencer = _TypeInferencer(type_index, node_ids)
+    inferencer.collect_types(tree, module_qname)
+
+    # Pass 3: structural type inference
+    inferencer.infer_structural_types(edges)
+
+    # Build name index for resolution
+    name_index: dict[str, list[str]] = {}
+    all_node_ids_for_index = node_ids  # includes existing
+    for n in nodes:
+        name_index.setdefault(n.name, []).append(n.id)
+        parts = n.qualified_name.split(".")
+        for i in range(1, len(parts)):
+            suffix = ".".join(parts[i:])
+            name_index.setdefault(suffix, []).append(n.id)
+
+    # Pass 4: resolve edges
+    resolved_edges: list[EdgeData] = []
+    for e in edges:
+        if e.edge_type not in (EdgeType.READS, EdgeType.WRITES, EdgeType.CALLS, EdgeType.RETURNS):
+            resolved_edges.append(e)
+            continue
+
+        if e.edge_type == EdgeType.CALLS:
+            raw_target = e.target
+            callee_root = raw_target.split(".")[0]
+            if callee_root in _BUILTINS:
+                continue
+            resolved = inferencer.resolve(raw_target, e.source)
+            if resolved and resolved in node_ids:
+                resolved_edges.append(EdgeData(
+                    source=e.source, target=resolved,
+                    edge_type=e.edge_type, is_dead=e.is_dead,
+                    is_proposed=e.is_proposed, line=e.line,
+                    metadata=e.metadata,
+                ))
+            else:
+                resolved_edges.append(e)
+            continue
+
+        raw_target = e.target
+        resolved = inferencer.resolve(raw_target, e.source)
+        if resolved is None:
+            continue
+
+        if resolved in node_ids:
+            if resolved != raw_target:
+                e = EdgeData(
+                    source=e.source, target=resolved,
+                    edge_type=e.edge_type, is_dead=e.is_dead,
+                    is_proposed=e.is_proposed, line=e.line,
+                    metadata=e.metadata,
+                )
+            resolved_edges.append(e)
+            continue
+
+        if "." in resolved:
+            parts = resolved.split(".")
+            found = False
+            for i in range(len(parts), 0, -1):
+                candidate = ".".join(parts[:i])
+                if candidate in node_ids:
+                    resolved_edges.append(EdgeData(
+                        source=e.source, target=candidate,
+                        edge_type=e.edge_type, is_dead=e.is_dead,
+                        is_proposed=e.is_proposed, line=e.line,
+                        metadata=e.metadata,
+                    ))
+                    found = True
+                    break
+            if found:
+                continue
+
+        if "." not in resolved:
+            if resolved in name_index:
+                resolved_edges.append(EdgeData(
+                    source=e.source, target=resolved,
+                    edge_type=e.edge_type, is_dead=e.is_dead,
+                    is_proposed=e.is_proposed, line=e.line,
+                    metadata=e.metadata,
+                ))
+
+    return nodes, resolved_edges
+
+
+def path_to_module(rel_path: Path) -> str:
+    """Convert a relative file path to a dotted module name. Public API."""
+    return _path_to_module(rel_path)
+
+
 def parse_project(root: str | Path) -> tuple[list[NodeData], list[EdgeData]]:
     """Walk a Python project directory and extract all symbols and edges."""
     root = Path(root).resolve()
@@ -225,6 +362,11 @@ def _extract_from_module(
     visitor = _SymbolVisitor(module_qname, file_path, nodes, edges)
     visitor.visit(tree)
 
+    # Extract module-level calls (statements that run on import, outside any
+    # function/class body). This captures things like app.add_middleware(...),
+    # Field(...) in Pydantic models, etc.
+    visitor._extract_scope_level_calls(tree, module_qname)
+
     return nodes, edges
 
 
@@ -296,7 +438,17 @@ class _SymbolVisitor(ast.NodeVisitor):
                     source=qname, target=base_name,
                     edge_type=EdgeType.INHERITS, line=node.lineno,
                 ))
+        # Class decorators are calls from the enclosing scope
+        for deco in node.decorator_list:
+            deco_name = _name_from_node(deco.func if isinstance(deco, ast.Call) else deco)
+            if deco_name:
+                self._edges.append(EdgeData(
+                    source=self._current_scope, target=deco_name,
+                    edge_type=EdgeType.CALLS, line=deco.lineno,
+                ))
         self._scope_stack.append(qname)
+        # Extract calls and variable access at class body scope
+        self._extract_scope_level_calls(node, qname)
         self.generic_visit(node)
         self._scope_stack.pop()
 
@@ -324,6 +476,24 @@ class _SymbolVisitor(ast.NodeVisitor):
             source=self._current_scope, target=qname,
             edge_type=EdgeType.CONTAINS, line=node.lineno,
         ))
+
+        # Decorators are calls — @app.post("/x") calls app.post, and the
+        # decorated function is the implicit argument. This means the
+        # enclosing scope calls the decorator, and the decorator calls the
+        # function being defined (making it reachable).
+        for deco in node.decorator_list:
+            deco_name = _name_from_node(deco.func if isinstance(deco, ast.Call) else deco)
+            if deco_name:
+                # Enclosing scope calls the decorator
+                self._edges.append(EdgeData(
+                    source=self._current_scope, target=deco_name,
+                    edge_type=EdgeType.CALLS, line=deco.lineno,
+                ))
+                # Decorator calls (registers) the decorated function
+                self._edges.append(EdgeData(
+                    source=deco_name, target=qname,
+                    edge_type=EdgeType.CALLS, line=deco.lineno,
+                ))
 
         self._extract_parameters(node, qname)
 
@@ -389,6 +559,32 @@ class _SymbolVisitor(ast.NodeVisitor):
                         edge_type=EdgeType.CONTAINS, line=node.lineno,
                     ))
         self.generic_visit(node)
+
+    # -- Scope-level calls (module / class body) --------------------------
+
+    def _extract_scope_level_calls(self, scope_node: ast.AST, scope_qname: str) -> None:
+        """Extract calls and reads from module-level or class-level statements.
+
+        These are statements that execute when the module imports or the class
+        body runs — NOT inside function/method bodies. This captures things like
+        module-level function calls, class-level assignments with calls, etc.
+        We only look at direct children of the scope, not nested function bodies.
+        """
+        body = getattr(scope_node, "body", [])
+        for stmt in body:
+            # Skip function/class defs — their bodies don't run at scope level
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
+            # Walk this statement for calls
+            for node in ast.walk(stmt):
+                if isinstance(node, ast.Call):
+                    callee = _name_from_node(node.func)
+                    if callee:
+                        self._edges.append(EdgeData(
+                            source=scope_qname, target=callee,
+                            edge_type=EdgeType.CALLS,
+                            line=getattr(node, "lineno", None),
+                        ))
 
     # -- Internal helpers --------------------------------------------------
 
@@ -493,37 +689,39 @@ class _SymbolVisitor(ast.NodeVisitor):
                 param_names.add(func_node.args.kwarg.arg)
 
         # Collect local assignment targets
+        # Skip _ everywhere — Python's universal "intentional discard" convention
+        _SKIP = {"self", "cls", "_"} | _BUILTINS
         for node in ast.walk(func_node):
             if isinstance(node, ast.Assign):
                 for t in node.targets:
                     for name in _assigned_names(t):
-                        if name not in ("self", "cls") and name not in _BUILTINS:
+                        if name not in _SKIP:
                             local_names.add(name)
             elif isinstance(node, ast.AugAssign):
                 name = _name_from_node(node.target)
-                if name and name not in ("self", "cls") and name not in _BUILTINS and "." not in name:
+                if name and name not in _SKIP and "." not in name:
                     local_names.add(name)
             elif isinstance(node, ast.AnnAssign) and node.value and node.target:
                 name = _name_from_node(node.target)
-                if name and name not in ("self", "cls") and name not in _BUILTINS and "." not in name:
+                if name and name not in _SKIP and "." not in name:
                     local_names.add(name)
             # For-loop targets
             elif isinstance(node, ast.For):
-                if isinstance(node.target, ast.Name):
+                if isinstance(node.target, ast.Name) and node.target.id not in _SKIP:
                     local_names.add(node.target.id)
                 elif isinstance(node.target, (ast.Tuple, ast.List)):
                     for elt in node.target.elts:
-                        if isinstance(elt, ast.Name):
+                        if isinstance(elt, ast.Name) and elt.id not in _SKIP:
                             local_names.add(elt.id)
 
             # Comprehension loop variables (listcomp, setcomp, genexpr, dictcomp)
             elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
                 for gen in node.generators:
-                    if isinstance(gen.target, ast.Name):
+                    if isinstance(gen.target, ast.Name) and gen.target.id not in _SKIP:
                         local_names.add(gen.target.id)
                     elif isinstance(gen.target, (ast.Tuple, ast.List)):
                         for elt in gen.target.elts:
-                            if isinstance(elt, ast.Name):
+                            if isinstance(elt, ast.Name) and elt.id not in _SKIP:
                                 local_names.add(elt.id)
 
         # Create local variable nodes (not params -- those already exist)
