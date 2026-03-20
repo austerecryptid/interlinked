@@ -1399,6 +1399,67 @@ class TestFalsePositiveEdges:
             f"calls_shared_helper resolved to foreign _shared_helper: {foreign_match}"
 
 
+# ══════════════════════════════════════════════════════════════════════
+# REGRESSION: trace_variable must not hang on ubiquitous variables
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestTraceVariable:
+    """Regression test for trace_variable combinatorial explosion.
+
+    trace_variable previously called nx.all_simple_paths for every
+    (writer, reader) pair with no cap on path count. For common
+    variables with many readers/writers this caused an infinite loop.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        self.graph, self.engine, _, _ = _build(FIXTURES)
+
+    def test_trace_common_variable_terminates(self):
+        """Tracing a variable that appears in many scopes must complete quickly."""
+        import signal
+
+        class _Timeout(Exception):
+            pass
+
+        def _handler(signum, frame):
+            raise _Timeout("trace_variable did not terminate within timeout")
+
+        # Pick a variable with many readers/writers across fixtures
+        # 'result' appears in 13+ read/write edges — enough to trigger
+        # the old combinatorial explosion in all_simple_paths
+        old = signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(30)  # 30 second hard limit
+        try:
+            nodes, edges, node_roles, edge_roles = self.graph.trace_variable("result")
+        except _Timeout:
+            pytest.fail("trace_variable('result') hung — combinatorial explosion regression")
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+
+        assert len(nodes) > 0, "trace_variable('result') should find nodes"
+
+    def test_trace_returns_valid_roles(self):
+        """trace_variable must return well-formed role dicts."""
+        nodes, edges, node_roles, edge_roles = self.graph.trace_variable("result")
+        valid_node_roles = {"origin", "mutator", "passthrough", "destination"}
+        for nid, role in node_roles.items():
+            assert role in valid_node_roles, f"Invalid node role '{role}' for {nid}"
+        valid_edge_roles = {"read", "write", "flow"}
+        for key, role in edge_roles.items():
+            assert role in valid_edge_roles, f"Invalid edge role '{role}' for {key}"
+
+    def test_trace_nonexistent_variable_returns_empty(self):
+        """Tracing a variable that doesn't exist should return empty, not crash."""
+        nodes, edges, node_roles, edge_roles = self.graph.trace_variable("zzz_no_such_var_zzz")
+        assert nodes == []
+        assert edges == []
+        assert node_roles == {}
+        assert edge_roles == {}
+
+
 class TestMCPFidelity:
     """Verify MCP dispatch produces the same results as direct engine calls."""
 

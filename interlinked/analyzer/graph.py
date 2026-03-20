@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from itertools import islice
 from typing import Any, Iterator
 
 import networkx as nx
@@ -445,17 +446,26 @@ class CodeGraph:
              if k not in ("contains", "inherits")]
         )
 
+        _MAX_PAIRS = 50
+        _MAX_PATHS_PER_PAIR = 10
+        pairs_checked = 0
         for w in writers:
             for r in readers:
                 if w == r:
                     continue
+                if pairs_checked >= _MAX_PAIRS:
+                    break
                 for src, tgt in [(w, r), (r, w)]:
                     if src in flow_graph and tgt in flow_graph:
                         try:
-                            for path in nx.all_simple_paths(flow_graph, src, tgt, cutoff=5):
+                            for path in islice(nx.all_simple_paths(flow_graph, src, tgt, cutoff=5), _MAX_PATHS_PER_PAIR):
                                 path_nodes.update(path)
                         except nx.NetworkXError:
                             pass
+                pairs_checked += 1
+            else:
+                continue
+            break
 
         # Also add ancestors/descendants of each writer/reader within the trace
         for nid in list(trace_func_ids):
